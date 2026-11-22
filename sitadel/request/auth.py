@@ -23,6 +23,24 @@ class Authenticator:
         self.csrf_field = csrf_field
         self.logged_in_check = logged_in_check
         self._lock = threading.Lock()
+        # Monotonic generation of the authenticated session.  Every login
+        # attempt (initial login or a mid-scan refresh) starts a new
+        # generation so authorization comparisons can tell whether two probes
+        # were made with the same authenticated identity/session.
+        self.generation = 0
+
+    @property
+    def session_generation(self):
+        """Alias used by the comparison transaction."""
+        return self.generation
+
+    @session_generation.setter
+    def session_generation(self, value):
+        self.generation = value
+
+    def current_session_generation(self):
+        """Method form of :attr:`session_generation`."""
+        return self.generation
 
     @classmethod
     def from_options(cls, *, basic=None, bearer=None, headers=None,
@@ -77,6 +95,9 @@ class Authenticator:
             return None
         # Serialize concurrent logins (the attack phase is multi-threaded).
         with self._lock:
+            # Advance before the attempt: even a failed refresh is a boundary
+            # that invalidates responses collected under the old session.
+            self.generation += 1
             data = dict(self.login_data)
             data.update(self._extract_csrf(session, verify, timeout))
             try:

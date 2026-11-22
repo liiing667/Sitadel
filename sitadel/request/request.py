@@ -65,6 +65,9 @@ class SingleRequest:
         self.verify = verify
         # Optional authentication context (headers + a shared cookie jar).
         self.authenticator = None
+        # Test/extension override for the session generation.  Normal scans
+        # derive it from the authenticator below.
+        self._session_generation_override = None
 
         # Global rate limiter shared by every request this factory sends.
         self.rate_limit = float(rate_limit or 0)
@@ -102,6 +105,33 @@ class SingleRequest:
     def set_authenticator(self, authenticator):
         self.authenticator = authenticator
 
+    @property
+    def session_generation(self):
+        """Generation of the current authenticated session (0 if anonymous).
+
+        ``Authenticator.login`` advances this value.  Authorization probes use
+        it to keep every response in a comparison tied to one session state,
+        so a mid-transaction re-login cannot mix two authenticated identities
+        (or an authenticated response with an anonymous one).
+        """
+        if self._session_generation_override is not None:
+            return self._session_generation_override
+        authenticator = self.authenticator
+        if authenticator is None:
+            return 0
+        generation = getattr(authenticator, "generation", None)
+        if generation is None:
+            generation = getattr(authenticator, "session_generation", None)
+        return 0 if generation is None else generation
+
+    @session_generation.setter
+    def session_generation(self, value):
+        self._session_generation_override = value
+
+    def current_session_generation(self):
+        """Method form of :attr:`session_generation` for older callers."""
+        return self.session_generation
+
     def login(self):
         """Run the configured login flow, populating the session cookie jar."""
         if self.authenticator is not None and self.authenticator.has_login:
@@ -121,6 +151,7 @@ class SingleRequest:
         if not self._in_scope(url):
             output.debug("Skipping out-of-scope request: %s" % url)
             return None
+        generation_before = self.session_generation
         prepped = self.prepare_request(url, method, payload, headers, cookies)
         # File-only trace of every request the scan makes. Since all attack
         # modules send their probes through here, this records exactly which
@@ -152,7 +183,7 @@ class SingleRequest:
                 self.authenticator.login(self.session, self.verify, self.timeout)
                 return self.send(url, method, payload, headers, cookies,
                                  allow_redirects=allow_redirects, _retry=False)
-            return resp
+            return self._annotate_response(resp, url, generation_before)
         except Timeout:
             # requests raises requests.exceptions.Timeout (a RequestException),
             # not the builtin TimeoutError, so it must be caught explicitly.
@@ -164,6 +195,22 @@ class SingleRequest:
         # On any handled error return None so callers can degrade gracefully
         # (a single failing request must never abort the whole scan).
         return None
+
+    def _annotate_response(self, response, requested_url, generation_before):
+        """Attach transaction metadata to a response, without changing it."""
+        try:
+            response.sitadel_requested_url = requested_url
+            response.sitadel_session_generation = generation_before
+            response.sitadel_session_generation_after = self.session_generation
+            # Plain aliases make the metadata easy to consume from plugins
+            # and test doubles without depending on the Sitadel prefix.
+            response.requested_url = requested_url
+            response.session_generation = generation_before
+        except Exception:
+            # Some response doubles use ``__slots__``; comparison still works
+            # by reading the request factory's generation directly.
+            pass
+        return response
 
     def prepare_request(self, url, method, payload, headers, cookies):
         payload = payload or {}
