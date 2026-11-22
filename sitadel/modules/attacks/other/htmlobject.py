@@ -5,6 +5,8 @@ from .. import AttackPlugin
 
 
 class HtmlObject(AttackPlugin):
+    # Looks for HTML <object> tags on rendered pages only.
+    surfaces = ("html",)
     def process(self, start_url, crawled_urls):
         output = Services.get("output")
         request = Services.get("request_factory")

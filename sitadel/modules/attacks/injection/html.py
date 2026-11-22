@@ -3,6 +3,9 @@ from .. import AttackPlugin
 
 
 class Html(AttackPlugin):
+    # HTML markup injection only makes sense against rendered HTML pages; the
+    # profile's surface condition skips it on a positively-identified API.
+    surfaces = ("html",)
     output = Services.get("output")
     request = Services.get("request_factory")
     logger = Services.get("logger")

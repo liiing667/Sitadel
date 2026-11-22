@@ -16,7 +16,7 @@ from sitadel.config.settings import Risk
 from sitadel.request.request import SingleRequest
 from sitadel.utils import banner, manager, output, validator
 from sitadel.utils.container import Services
-from sitadel.model import TargetProfile
+from sitadel.model import TargetProfile, close_generation, start_generation
 from sitadel.modules.discovery import discover as discover_api
 from sitadel.report import Findings, write_report
 from sitadel.request.auth import Authenticator
@@ -254,7 +254,13 @@ class Sitadel(object):
         Services.register("logger", logger)
         Services.register("output", Output(args.verbosity, quiet=quiet))
         Services.register("findings", Findings())
-        Services.register("profile", TargetProfile())
+        profile = TargetProfile()
+        Services.register("profile", profile)
+        # Open one rule generation for this scan attempt: the plugin sets, the
+        # profile conditions, attack execution and the finding source now share
+        # this epoch, so a fingerprint retry/plugin reload that changes the
+        # profile cannot leave a contradicting attack collection running.
+        start_generation(profile=profile)
         Services.register(
             "request_factory",
             SingleRequest(
@@ -356,6 +362,9 @@ class Sitadel(object):
         except KeyboardInterrupt:
             raise
         finally:
+            # Seal the generation: late findings from stale workers are now
+            # rejected even if threads are still draining.
+            close_generation()
             # Write the findings report (console findings are printed live by
             # Output.finding regardless of the chosen format).
             if args.report_format != "stdout":

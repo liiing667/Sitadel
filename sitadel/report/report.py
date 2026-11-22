@@ -42,6 +42,10 @@ class Finding:
     occurrences: int = 1
     # Extra URLs (beyond ``url``) where the same de-duplicated issue was seen.
     other_urls: list[str] = field(default_factory=list)
+    # Rule generation (rule epoch) that produced the finding. ``None`` for
+    # generation-unaware/legacy callers; the Output layer drops findings whose
+    # id does not match the active generation before they reach the collector.
+    generation_id: int | None = None
 
 
 def _normalize_url(url: str | None) -> str:

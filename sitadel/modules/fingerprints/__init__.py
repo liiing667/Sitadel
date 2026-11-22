@@ -4,6 +4,7 @@ import pkgutil
 
 from sitadel.config import settings
 from sitadel.config.settings import Risk
+from sitadel.model.generation import current_generation
 from sitadel.utils.container import Services
 from .. import IPlugin
 
@@ -19,12 +20,23 @@ class FingerprintPlugin(metaclass=IPlugin):
         Filtering is done here, at run time, so changing the risk level (or
         loading the configuration after the plugins were imported) always
         takes effect instead of depending on import ordering.
+
+        Under an active :class:`RuleGeneration`, the result is intersected with
+        that generation's frozen plugin snapshot, keeping the fingerprint
+        plugin set stable across retries/reloads.
         """
-        return [
+        eligible = [
             plugin
             for plugin in cls.plugins
             if getattr(plugin, "level", Risk.NO_DANGER) <= settings.risk
         ]
+        generation = current_generation()
+        if generation is None:
+            return eligible
+        snapshot = generation.plugin_set(cls)
+        if not snapshot:
+            snapshot = generation.freeze_plugins(cls, eligible)
+        return [plugin for plugin in eligible if plugin in snapshot]
 
     def process(self, headers, content):
         raise NotImplementedError(str(self) + ": Process method not found")
@@ -73,6 +85,21 @@ class Fingerprints:
 
             # Pass the result over the fingerprint module for processing.
             # Instantiate each plugin once (not twice) per scan.
+            generation = current_generation()
+            if generation is not None and not generation.plugin_set(
+                FingerprintPlugin
+            ):
+                # Freeze the fingerprint set before processing so later plugin
+                # imports (retry/reload) cannot change this generation's rules.
+                generation.freeze_plugins(
+                    FingerprintPlugin,
+                    [
+                        plugin
+                        for plugin in FingerprintPlugin.plugins
+                        if getattr(plugin, "level", Risk.NO_DANGER)
+                        <= settings.risk
+                    ],
+                )
             fingerprints = []
             for plugin in FingerprintPlugin.enabled():
                 instance = plugin()
@@ -93,7 +120,10 @@ class Fingerprints:
                     self.output.finding(
                         "{category} detected: {result}".format(
                             category=category, result=result
-                        )
+                        ),
+                        generation_id=(
+                            generation.id if generation is not None else None
+                        ),
                     )
                     # `category` is the plugin's package name (lang, server, …).
                     if profile is not None:

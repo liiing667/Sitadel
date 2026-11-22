@@ -296,6 +296,15 @@ def crawl(url, user_agent):
     urls, form_targets, page_bodies = asyncio.run(
         _crawl(str(url), user_agent, _config())
     )
+    # A page, form or body that rendered HTML positively identifies an HTML
+    # surface. This is the profile condition HTML-only plugins are gated on;
+    # it stays unset when the crawler found nothing, leaving the gates
+    # fail-open. A confirmed API surface always wins (see TargetProfile).
+    if urls or form_targets or page_bodies:
+        try:
+            Services.get("profile").mark_html()
+        except NameError:
+            pass
     # Expose the fetched page bodies for the passive secret scanner (registered
     # as a side effect like ``form_targets``, so re-fetching is unnecessary).
     if page_bodies:

@@ -6,6 +6,7 @@ from colorama import Fore, Style
 
 from sitadel.report import Finding, Severity
 from sitadel.report.knowledge import lookup as _lookup_knowledge
+from sitadel.model.generation import current_generation
 from sitadel.utils.container import Services
 from sitadel.utils.events import FindingAdded, Log
 
@@ -44,7 +45,8 @@ class Output:
                 confidence: str | None = None, cwe: str | None = None,
                 owasp: str | None = None, wstg: str | None = None,
                 remediation: str | None = None,
-                finding_type: str | None = None) -> None:
+                finding_type: str | None = None,
+                generation_id: int | None = None) -> None:
         r"""Report a finding: print it, log it, and record it for the report.
 
         Only ``value`` is required, so legacy ``finding("text")`` calls keep
@@ -52,7 +54,24 @@ class Output:
         remediation/standards knowledge base (keyed by ``finding_type`` or the
         ``plugin`` name), so even single-string findings gain a sane severity,
         confidence, and CWE/OWASP/WSTG mapping. Explicit arguments always win.
+
+        ``generation_id`` ties the finding to the rule generation (rule epoch)
+        that produced it. When a generation is active, findings stamped with a
+        different id — stale workers from a previous fingerprint retry or plugin
+        reload — are dropped so the finding source always matches the final
+        profile. Untagged findings (``None``) stay fail-open for legacy callers.
         """
+        generation = current_generation()
+        if generation is not None and not generation.accepts_finding(
+            generation_id
+        ):
+            self.logger.debug(
+                "Dropping finding from stale generation %s (active=%s): %s",
+                generation_id,
+                generation.id,
+                value,
+            )
+            return
         if not self.quiet:
             print(f"{self.g}[+]{self.e} {self.w}{value}{self.e}", flush=True)
         self.logger.info("FINDING: %s", value)
@@ -76,6 +95,7 @@ class Output:
             owasp=pick(owasp, "owasp"),
             wstg=pick(wstg, "wstg"),
             remediation=pick(remediation, "remediation"),
+            generation_id=generation_id,
         )
 
         # Record for report generation, when a collector is registered.

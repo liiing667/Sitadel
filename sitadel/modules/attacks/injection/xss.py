@@ -4,6 +4,9 @@ from .. import AttackPlugin
 
 
 class Xss(AttackPlugin):
+    # XSS payloads execute in an HTML/browser context; an API target never
+    # renders them, so the generation's profile gate skips this class there.
+    surfaces = ("html",)
     output = Services.get("output")
     request = Services.get("request_factory")
     datastore = Services.get("datastore")

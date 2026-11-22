@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from sitadel.config import settings
 from sitadel.config.settings import Risk
+from sitadel.model.generation import current_generation
 from sitadel.utils.container import Services
 from sitadel.utils.events import (
     PageTesting,
@@ -44,6 +45,13 @@ class AttackPlugin(metaclass=IPlugin):
     # attack applies to any target.
     requires: dict = {}
 
+    # Target surfaces this attack makes sense on. ``"any"`` (the default,
+    # including for every legacy plugin that never declares a surface) runs
+    # everywhere; plugins may declare ``("html",)`` or ``("api",)`` so the
+    # generation's profile conditions can skip them when the final profile
+    # positively identifies a different surface.
+    surfaces: tuple = ("any",)
+
     def applies_to(self, profile):
         """Whether this attack is relevant given the fingerprint profile.
 
@@ -55,6 +63,16 @@ class AttackPlugin(metaclass=IPlugin):
         """
         if profile is None:
             return True
+        # Surface conditions, same fail-open rule: only a positively
+        # identified surface can exclude a plugin. An empty/undecided profile
+        # (``surface is None``) never skips anything, and a surface-agnostic
+        # plugin (``"any"``) always passes this check.
+        declared = tuple(str(s).lower() for s in (self.surfaces or ("any",)))
+        if "any" not in declared:
+            if profile.is_api() and "api" not in declared:
+                return False
+            if profile.is_html() and "html" not in declared:
+                return False
         for key, expected in self.requires.items():
             detected = profile.get(key)
             if detected is None:
@@ -70,12 +88,26 @@ class AttackPlugin(metaclass=IPlugin):
         Filtering is done here, at run time, so changing the risk level (or
         loading the configuration after the plugins were imported) always
         takes effect instead of depending on import ordering.
+
+        When a :class:`RuleGeneration` is active, the risk-filtered registry is
+        also intersected with the plugin set that generation froze at start
+        time: plugins imported afterwards (e.g. on a retry after a profile
+        change) cannot leak into the running generation's attack collection.
         """
-        return [
+        eligible = [
             plugin
             for plugin in cls.plugins
             if getattr(plugin, "level", Risk.NO_DANGER) <= settings.risk
         ]
+        generation = current_generation()
+        if generation is None:
+            return eligible
+        snapshot = generation.plugin_set(cls)
+        if not snapshot:
+            # No frozen set yet: freeze now, at first consultation, so the
+            # selection is stable for the rest of this generation.
+            snapshot = generation.freeze_plugins(cls, eligible)
+        return [plugin for plugin in eligible if plugin in snapshot]
 
     # ``taint_url`` stays available for any plugin still working URL-first; the
     # implementation now lives in ``targets`` alongside the body taints.
@@ -120,6 +152,12 @@ class AttackPlugin(metaclass=IPlugin):
         logger = Services.get("logger")
         request = Services.get("request_factory")
         targets = self.build_targets(crawled_urls)
+        # Freeze the generation id once: every probe and finding produced by
+        # this module is attributed to the same rule epoch, so a generation
+        # switch mid-run (fingerprint retry/plugin reload) makes the stale
+        # worker's findings get rejected instead of polluting the new profile.
+        generation = current_generation()
+        generation_id = generation.id if generation is not None else None
         # Announce each endpoint under test once (not per payload) so the crawl
         # tree can mark it without flooding the event bus.
         announced: set = set()
@@ -127,6 +165,12 @@ class AttackPlugin(metaclass=IPlugin):
         def probe(payload, target):
             try:
                 if _cancelled():
+                    return
+                # The generation may have been superseded while this probe was
+                # queued; stop attacking under rules that no longer match the
+                # final profile.
+                active = current_generation()
+                if active is not None and active.id != generation_id:
                     return
                 kwargs = taint_target(target, payload)
                 if kwargs is None:
@@ -157,6 +201,7 @@ class AttackPlugin(metaclass=IPlugin):
                         plugin=type(self).__name__,
                         parameter=parameter,
                         evidence="payload=%s | matched=%s" % (payload, label),
+                        generation_id=generation_id,
                     )
             except Exception as err:
                 logger.error(err)
@@ -225,10 +270,32 @@ class Attacks:
             profile = None
 
         try:
+            generation = current_generation()
+            # Freeze this generation's attack plugin set *before* anything
+            # runs: later imports (retry/reload) append to the process-wide
+            # registry but cannot alter the snapshot this scan executes.
+            if generation is not None:
+                if not generation.plugin_set(AttackPlugin):
+                    generation.freeze_plugins(
+                        AttackPlugin,
+                        [
+                            plugin
+                            for plugin in AttackPlugin.plugins
+                            if getattr(plugin, "level", Risk.NO_DANGER)
+                            <= settings.risk
+                        ],
+                    )
             selected = []
             for plugin in AttackPlugin.enabled():
                 instance = plugin()
-                if instance.applies_to(profile):
+                # Profile conditions are evaluated through the generation so
+                # the plugin set, the gating and the finding source share one
+                # rule epoch and see the same (final) profile.
+                if generation is not None:
+                    applicable = generation.applies(instance)
+                else:
+                    applicable = instance.applies_to(profile)
+                if applicable:
                     selected.append(instance)
                 else:
                     self.output.info(
@@ -247,6 +314,15 @@ class Attacks:
             for i, instance in enumerate(selected):
                 if _cancelled():
                     break
+                # A superseded generation must not keep executing attack
+                # collections that contradict the new profile.
+                active = current_generation()
+                if (
+                    generation is not None
+                    and active is not None
+                    and active.id != generation.id
+                ):
+                    break
                 result = instance.process(self.start_url, self.crawled_urls)
                 attacks.append((instance, result))
                 _publish(ProgressSnap((i + 1) * unit))
@@ -255,7 +331,10 @@ class Attacks:
                     self.output.finding(
                         "{category} detected: {result}".format(
                             category=category, result=result
-                        )
+                        ),
+                        generation_id=(
+                            generation.id if generation is not None else None
+                        ),
                     )
 
         except Exception as e:

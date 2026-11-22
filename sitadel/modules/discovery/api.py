@@ -195,8 +195,9 @@ def discover(start_url, request, profile=None, force=False, output=None):
     """Discover API targets for ``start_url``.
 
     Fetches a spec from the well-known locations; on success returns the
-    endpoints as ``Target``s and marks ``profile.api_type = "rest"``. When no
-    spec is found, probes a few REST prefixes so at least the API style is
+    endpoints as ``Target``s and marks the profile's surface as an API
+    (``profile.mark_api("rest")``, which also sets ``api_type``). When no spec
+    is found, probes a few REST prefixes so at least the API style is
     recorded. Returns a list of ``Target`` (possibly empty).
     """
     origin = _origin(start_url)
@@ -213,7 +214,7 @@ def discover(start_url, request, profile=None, force=False, output=None):
             continue
         targets = targets_from_spec(doc, origin)
         if profile is not None:
-            profile.api_type = "rest"
+            profile.mark_api("rest")
         if output is not None:
             output.info(
                 "API spec found at %s: %d endpoint(s) enumerated"
@@ -232,7 +233,7 @@ def discover(start_url, request, profile=None, force=False, output=None):
         ctype = resp.headers.get("Content-Type", "") if resp.headers else ""
         if resp.status_code < 500 and "json" in ctype.lower():
             if profile is not None:
-                profile.api_type = "rest"
+                profile.mark_api("rest")
             if output is not None:
                 output.info(
                     "REST surface detected at %s (no spec; body injection needs "
