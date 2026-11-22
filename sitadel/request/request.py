@@ -102,6 +102,33 @@ class SingleRequest:
     def set_authenticator(self, authenticator):
         self.authenticator = authenticator
 
+    @property
+    def session_generation(self):
+        """Generation of the current authenticated session.
+
+        ``Authenticator.login`` advances this value.  Attack modules use it to
+        keep every observation in one comparison/replay transaction tied to a
+        single cookie jar; a mid-transaction re-login must never be allowed to
+        turn an old baseline into evidence for a new session.
+        """
+        authenticator = self.authenticator
+        if authenticator is None:
+            return 0
+        for name in ("generation", "session_generation"):
+            value = getattr(authenticator, name, None)
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    value = None
+            if value is not None:
+                return value
+        return 0
+
+    def current_session_generation(self):
+        """Method form of :attr:`session_generation` for older callers."""
+        return self.session_generation
+
     def login(self):
         """Run the configured login flow, populating the session cookie jar."""
         if self.authenticator is not None and self.authenticator.has_login:
@@ -115,6 +142,7 @@ class SingleRequest:
         # callers pass ``False`` to inspect a redirect (e.g. the open-redirect
         # check reads the Location header without following it off-site).
         follow = self.redirect if allow_redirects is None else allow_redirects
+        generation_before = self.session_generation
         # Scope gate: never initiate a request to an out-of-scope host (the
         # destination is what matters — an SSRF/open-redirect payload points
         # inward but the request itself still targets the in-scope host).
@@ -150,9 +178,20 @@ class SingleRequest:
             if _retry and self.authenticator is not None \
                     and self.authenticator.looks_logged_out(resp):
                 self.authenticator.login(self.session, self.verify, self.timeout)
-                return self.send(url, method, payload, headers, cookies,
-                                 allow_redirects=allow_redirects, _retry=False)
-            return resp
+                retried = self.send(url, method, payload, headers, cookies,
+                                    allow_redirects=allow_redirects, _retry=False)
+                try:
+                    retried.sitadel_reauthenticated = True
+                    retried.sitadel_session_generation_before_retry = (
+                        generation_before
+                    )
+                    retried.sitadel_session_generation_after_retry = (
+                        self.session_generation
+                    )
+                except Exception:
+                    pass
+                return retried
+            return self._annotate_response(resp, url, generation_before)
         except Timeout:
             # requests raises requests.exceptions.Timeout (a RequestException),
             # not the builtin TimeoutError, so it must be caught explicitly.
@@ -164,6 +203,24 @@ class SingleRequest:
         # On any handled error return None so callers can degrade gracefully
         # (a single failing request must never abort the whole scan).
         return None
+
+    def _annotate_response(self, response, requested_url, generation_before):
+        """Attach transaction metadata to a response without changing it.
+
+        These attributes are deliberately optional/private-by-convention: test
+        doubles and ``requests`` response subclasses may not accept new
+        attributes, and a missing annotation simply means the caller falls back
+        to the request factory's current generation.
+        """
+        try:
+            response.sitadel_requested_url = requested_url
+            response.sitadel_session_generation = generation_before
+            response.sitadel_session_generation_after = self.session_generation
+            response.sitadel_login_generation = generation_before
+            response.sitadel_login_generation_after = self.session_generation
+        except Exception:
+            pass
+        return response
 
     def prepare_request(self, url, method, payload, headers, cookies):
         payload = payload or {}

@@ -14,7 +14,7 @@ import base64
 import hashlib
 import hmac
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jwt as pyjwt
 
@@ -26,19 +26,52 @@ class TokenLocation:
     ``kind`` is ``"header"`` or ``"cookie"``; ``name`` is the header/cookie
     name; ``prefix`` is any scheme prefix to preserve when re-sending (e.g.
     ``"Bearer "`` for an ``Authorization`` header); ``token`` is the raw JWT.
+    ``generation`` is stamped by the attack plugin when the token is
+    discovered, binding these exact token bytes to the authenticated session
+    that was current at discovery time.
     """
 
     kind: str
     name: str
     prefix: str
     token: str
+    generation: int | None = field(default=None, compare=False)
+
+    @property
+    def token_bytes(self) -> str:
+        """The exact JWT bytes/wire value that must be replayed."""
+        return self.token
+
+    @property
+    def position(self) -> str:
+        """Human-readable header/cookie location."""
+        return f"{self.kind} '{self.name}'"
+
+    @property
+    def source(self) -> str:
+        """Machine-readable header/cookie location."""
+        return f"{self.kind}:{self.name}"
+
+    @property
+    def login_generation(self) -> int | None:
+        """Alias for the session generation captured at discovery."""
+        return self.generation
+
+    def __hash__(self) -> int:
+        # ``generation`` intentionally does not participate in equality (so
+        # callers can compare token slots), and it must not participate in the
+        # hash either.
+        return hash((self.kind, self.name, self.prefix, self.token))
 
 
-def discover_tokens(headers: dict | None, cookies: dict | None) -> list["TokenLocation"]:
+def discover_tokens(headers: dict | None, cookies: dict | None,
+                    generation: int | None = None) -> list["TokenLocation"]:
     """Find JWTs among request headers and cookies.
 
     Handles ``Authorization: Bearer <jwt>`` (preserving the ``Bearer`` prefix),
-    bare JWT header values, and cookie values that are JWTs.
+    bare JWT header values, and cookie values that are JWTs.  ``generation``
+    (when supplied by the caller) binds every discovered token to the
+    authenticated session that was current at discovery time.
     """
     found: list[TokenLocation] = []
     for name, value in (headers or {}).items():
@@ -48,10 +81,12 @@ def discover_tokens(headers: dict | None, cookies: dict | None) -> list["TokenLo
         if candidate.lower().startswith("bearer "):
             prefix, candidate = candidate[:7], candidate[7:].strip()
         if looks_like_jwt(candidate):
-            found.append(TokenLocation("header", name, prefix, candidate))
+            found.append(TokenLocation(
+                "header", name, prefix, candidate, generation
+            ))
     for name, value in (cookies or {}).items():
         if isinstance(value, str) and looks_like_jwt(value):
-            found.append(TokenLocation("cookie", name, "", value))
+            found.append(TokenLocation("cookie", name, "", value, generation))
     return found
 
 
