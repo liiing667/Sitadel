@@ -245,7 +245,10 @@ class Sitadel(object):
             args.rate_limit if args.rate_limit is not None
             else http_cfg.get("rate_limit", 0)
         )
-        scope_hosts = list(http_cfg.get("scope_hosts", []) or [])
+        configured_hosts = http_cfg.get("scope_hosts", []) or []
+        if isinstance(configured_hosts, str):
+            configured_hosts = [configured_hosts]
+        scope_hosts = list(configured_hosts)
         if args.scope_hosts:
             scope_hosts.extend(args.scope_hosts)
 

@@ -2,8 +2,88 @@ from __future__ import annotations
 
 import base64
 import threading
+from urllib.parse import urljoin, urlsplit
 
 from selectolax.lexbor import LexborHTMLParser
+
+# Redirect handling for the login entry point. Login bodies carry the actual
+# credentials, so a redirect is followed only while it stays on the login URL's
+# origin; a cross-origin Location is never contacted.
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_MAX_REDIRECTS = 30
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str):
+    """Return ``(scheme, host, port)`` or ``None`` for an opaque URL."""
+    parts = urlsplit(url or "")
+    scheme = (parts.scheme or "").lower()
+    try:
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS[scheme]
+    return scheme, host, port
+
+
+def _same_origin(left: str, right: str) -> bool:
+    left_origin = _origin(left)
+    right_origin = _origin(right)
+    if left_origin is None or right_origin is None:
+        return left_origin == right_origin
+    if left_origin == right_origin:
+        return True
+    # Same safe HTTP -> HTTPS default-port upgrade requests itself allows.
+    return (
+        left_origin[0] == "http"
+        and right_origin[0] == "https"
+        and left_origin[1] == right_origin[1]
+        and left_origin[2] == 80
+        and right_origin[2] == 443
+    )
+
+
+def _redirect_location(resp):
+    """Return a redirect's Location value, or ``None`` if this is not one."""
+    status = getattr(resp, "status_code", None)
+    if status not in _REDIRECT_STATUSES:
+        return None
+    headers = getattr(resp, "headers", None) or {}
+    location = headers.get("Location") if hasattr(headers, "get") else None
+    if location is None and hasattr(headers, "items"):
+        for name, value in headers.items():
+            if str(name).lower() == "location":
+                location = value
+                break
+    if not location:
+        return None
+    if isinstance(location, bytes):
+        location = location.decode("latin-1")
+    location = str(location).strip()
+    return location or None
+
+
+def _resolve_redirect(location, resp, current_url: str):
+    """Resolve a Location value to the next absolute HTTP(S) URL."""
+    try:
+        target = urljoin(getattr(resp, "url", None) or current_url, location)
+    except ValueError:
+        return None
+    parts = urlsplit(target)
+    try:
+        host = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in _DEFAULT_PORTS or not host:
+        return None
+    return target
 
 
 class Authenticator:
@@ -61,8 +141,14 @@ class Authenticator:
         if not self.csrf_field:
             return {}
         try:
-            resp = session.get(self.login_url, verify=verify, timeout=timeout)
+            resp = self._follow_same_origin(
+                session, "GET", self.login_url, verify, timeout
+            )
         except Exception:
+            return {}
+        if resp is None or getattr(resp, "status_code", None) in _REDIRECT_STATUSES:
+            # A stopped redirect response (cross-origin Location or a
+            # redirect-only body) is not the login form.
             return {}
         node = LexborHTMLParser(resp.text).css_first(
             f'input[name="{self.csrf_field}"]'
@@ -70,6 +156,88 @@ class Authenticator:
         if node is not None:
             return {self.csrf_field: node.attributes.get("value", "") or ""}
         return {}
+
+    @staticmethod
+    def _request_once(session, method, url, verify, timeout, data=None):
+        """Send one login-related request without letting requests redirect."""
+        if method == "GET":
+            return session.get(
+                url, verify=verify, timeout=timeout, allow_redirects=False
+            )
+        if method == "HEAD":
+            return session.head(
+                url, verify=verify, timeout=timeout, allow_redirects=False
+            )
+        if method == "POST":
+            return session.post(
+                url,
+                data=data,
+                verify=verify,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        return session.request(
+            method,
+            url,
+            data=data,
+            verify=verify,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+
+    def _follow_same_origin(self, session, method, url, verify, timeout,
+                            data=None):
+        """Follow login redirects only while they stay on ``url``'s origin.
+
+        This keeps the existing form-login flow (including CSRF extraction and
+        same-origin post-login redirects) while ensuring a cross-origin
+        Location never receives the login body or the session's cookie jar.
+        """
+        history = []
+        current_url = url
+        current_method = str(method).upper()
+        current_data = data
+
+        for _ in range(_MAX_REDIRECTS + 1):
+            resp = self._request_once(
+                session, current_method, current_url, verify, timeout,
+                data=current_data,
+            )
+            if resp is None:
+                return None
+            location = _redirect_location(resp)
+            if location is None:
+                resp.history = history
+                return resp
+            next_url = _resolve_redirect(location, resp, current_url)
+            if next_url is None:
+                return None
+            if not _same_origin(current_url, next_url):
+                # Stop on the redirect response. The Location host never sees
+                # the login POST body, Authorization header, or cookies.
+                resp.history = history
+                return resp
+
+            status = getattr(resp, "status_code", None)
+            if status == 303 and current_method != "HEAD":
+                current_method = "GET"
+            elif status == 302 and current_method != "HEAD":
+                current_method = "GET"
+            elif status == 301 and current_method == "POST":
+                current_method = "GET"
+            if status not in (307, 308):
+                current_data = None
+
+            resp.history = list(history)
+            history.append(resp)
+            try:
+                resp.content
+                resp.close()
+            except Exception:
+                pass
+            current_url = next_url
+
+        return None
 
     def login(self, session, verify=False, timeout=None):
         """Perform the form login through the session (stores cookies)."""
@@ -80,9 +248,8 @@ class Authenticator:
             data = dict(self.login_data)
             data.update(self._extract_csrf(session, verify, timeout))
             try:
-                return session.post(
-                    self.login_url, data=data, verify=verify,
-                    timeout=timeout, allow_redirects=True,
+                return self._follow_same_origin(
+                    session, "POST", self.login_url, verify, timeout, data=data
                 )
             except Exception:
                 return None

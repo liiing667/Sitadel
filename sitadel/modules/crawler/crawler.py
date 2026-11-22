@@ -9,6 +9,7 @@ from selectolax.lexbor import LexborHTMLParser
 
 from sitadel.config import settings
 from sitadel.modules.attacks.targets import Target
+from sitadel.request.request import _same_origin
 from sitadel.utils.container import Services
 from sitadel.utils.events import PageDiscovered
 
@@ -191,19 +192,59 @@ def form_signature(target: Target) -> tuple:
             target.method, target.body_format, names)
 
 
-async def _fetch(session: aiohttp.ClientSession, url: str, timeout: int) -> str | None:
-    try:
-        async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as resp:
-            ctype = resp.headers.get("Content-Type", "").lower()
-            if resp.status != 200 or "html" not in ctype:
-                return None
-            raw = await resp.read()
-            return raw.decode(resp.charset or "utf-8", errors="ignore")
-    except Exception:
-        # A single failing request must never abort the crawl.
-        return None
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_MAX_REDIRECTS = 10
+
+
+async def _fetch(session: aiohttp.ClientSession, url: str, timeout: int,
+                 allowed_host: str | None = None) -> str | None:
+    """Fetch one page, following only same-host redirects.
+
+    The crawler session carries the authenticated headers/cookies. Letting
+    aiohttp follow redirects automatically would send that material to any
+    Location host, so each hop is checked against the crawl host first.
+    """
+    current_url = url
+    if allowed_host is None:
+        # Direct callers get the same host pinning as the crawler.
+        try:
+            allowed_host = urlsplit(url).hostname
+        except ValueError:
+            allowed_host = None
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            async with session.get(
+                current_url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=False,
+            ) as resp:
+                if resp.status in _REDIRECT_STATUSES:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        return None
+                    next_url = urljoin(str(resp.url), location)
+                    parts = urlsplit(next_url)
+                    if parts.scheme not in ("http", "https"):
+                        return None
+                    if not _same_origin(current_url, next_url):
+                        # Never send authenticated crawl traffic across an
+                        # origin boundary (including scheme downgrades).
+                        return None
+                    if allowed_host and parts.hostname != allowed_host:
+                        # Never contact a redirect destination outside the
+                        # crawl host with the authenticated session.
+                        return None
+                    current_url = next_url
+                    continue
+                ctype = resp.headers.get("Content-Type", "").lower()
+                if resp.status != 200 or "html" not in ctype:
+                    return None
+                raw = await resp.read()
+                return raw.decode(resp.charset or "utf-8", errors="ignore")
+        except Exception:
+            # A single failing request must never abort the crawl.
+            return None
+    return None
 
 
 async def _crawl(start_url: str, user_agent: str, cfg: dict) -> list[str]:

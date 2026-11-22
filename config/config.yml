@@ -16,7 +16,9 @@ datastore: sitadel/data
 ## HTTP request tuning (attack phase)
 ## rate_limit: max requests/second across the whole scan (0 = unlimited).
 ## scope_hosts: extra hosts allowed besides the target (requests/redirects to
-## any other host are skipped). The target host is always in scope.
+## any other host are skipped). The target host is always in scope. Redirects
+## are checked hop by hop; auth headers/cookies only go to the original request
+## origin, so an explicitly scoped host is visited without credentials.
 http:
   rate_limit: 0
   scope_hosts: []
