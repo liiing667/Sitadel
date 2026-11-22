@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html as _html
 import json
+import os
+import secrets
+import tempfile
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from urllib.parse import urlsplit, urlunsplit
@@ -235,8 +238,178 @@ def to_html(findings: list[Finding]) -> str:
 _SERIALIZERS = {"json": to_json, "sarif": to_sarif, "html": to_html}
 
 
+class ReportError(Exception):
+    """A report publish transaction failed.
+
+    Raised by :func:`publish_report` when any output cannot be serialized,
+    staged, or committed. Publishing is all-or-nothing: when this is raised,
+    no partial output files are left behind and any pre-existing reports are
+    restored, so the artifacts on disk never mix scan generations.
+    """
+
+
+def _silent_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _stage(path: str, payload: str) -> str:
+    """Write ``payload`` to a temp file next to ``path``; return the temp path.
+
+    The temp file lives in the same directory as the destination, so the
+    later ``os.replace`` is an atomic rename on the same filesystem. The
+    payload is flushed and fsynced, and the file is opened up to the process
+    umask (``mkstemp`` forces 0600, which would make committed reports
+    unreadable to the group/others unlike the historical plain ``open``).
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".sitadel-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)
+    except BaseException:
+        _silent_unlink(tmp)
+        raise
+    return tmp
+
+
+def publish_report(findings: list[Finding],
+                   outputs: list[tuple[str, str]]) -> list[str]:
+    """Atomically publish one findings snapshot to every ``(fmt, path)``.
+
+    This is the single publish transaction shared by every report consumer:
+    the same ``findings`` snapshot feeds all requested formats, and the batch
+    is committed all-or-nothing —
+
+    1. every format is serialized up front (a serialization failure touches
+       nothing on disk),
+    2. each payload is staged to a temporary sibling file and fsynced,
+    3. pre-existing outputs are moved aside as backups,
+    4. the whole batch is renamed into place.
+
+    Any failure rolls back to the pre-transaction state (staged temps
+    removed, committed files withdrawn, backups restored) and raises
+    :class:`ReportError`, so a failed or retried export never leaves a
+    truncated, clean-looking, or mixed-generation set of report artifacts
+    behind. Returns the committed paths, in request order.
+    """
+    items = list(findings)
+    planned: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for fmt, path in outputs:
+        serializer = _SERIALIZERS[fmt]  # unknown format -> KeyError, as before
+        abspath = os.path.abspath(path)
+        if abspath in seen:
+            raise ReportError(f"duplicate report output path: {path}")
+        seen.add(abspath)
+        try:
+            payload = serializer(items)
+        except Exception as err:
+            raise ReportError(
+                f"could not serialize the {fmt} report: {err}"
+            ) from err
+        planned.append((abspath, payload))
+
+    token = secrets.token_hex(4)
+    staged: list[tuple[str, str]] = []   # (temp path, final path)
+    backups: list[tuple[str, str]] = []  # (final path, backup path)
+    committed: list[str] = []
+    try:
+        for path, payload in planned:
+            staged.append((_stage(path, payload), path))
+        for _tmp, path in staged:
+            if os.path.exists(path):
+                backup = f"{path}.sitadel-backup-{token}"
+                os.replace(path, backup)
+                backups.append((path, backup))
+        for tmp, path in staged:
+            os.replace(tmp, path)
+            committed.append(path)
+    except BaseException as err:
+        # Roll back to the pre-transaction state: drop staged temps, withdraw
+        # anything already committed, restore the previous generation.
+        for tmp, _path in staged:
+            _silent_unlink(tmp)
+        for path in committed:
+            _silent_unlink(path)
+        for path, backup in backups:
+            try:
+                os.replace(backup, path)
+            except OSError:
+                pass
+        if not isinstance(err, Exception):
+            # KeyboardInterrupt & co.: rolled back, but never swallowed.
+            raise
+        raise ReportError(f"could not write the report: {err}") from err
+    for _path, backup in backups:
+        _silent_unlink(backup)
+    return [path for path, _payload in planned]
+
+
 def write_report(findings: list[Finding], fmt: str, path: str) -> None:
-    """Serialize ``findings`` in ``fmt`` and write to ``path``."""
-    serializer = _SERIALIZERS[fmt]
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(serializer(findings))
+    """Serialize ``findings`` in ``fmt`` and write to ``path`` (atomically).
+
+    Single-output special case of :func:`publish_report`: the file appears
+    only once fully written, and a failure leaves no partial file behind.
+    """
+    publish_report(findings, [(fmt, path)])
+
+
+def parse_formats(value: str | None) -> list[str]:
+    """Parse a ``--format`` value into the file formats to publish.
+
+    Accepts a single format or a comma-separated list (case-insensitive).
+    ``stdout`` (the default) means "console only" and yields an empty list;
+    it cannot be combined with file formats. Raises ``ValueError`` on unknown
+    formats so bad invocations fail before any scan work starts.
+    """
+    tokens = [
+        tok.strip().lower() for tok in (value or "stdout").split(",")
+        if tok.strip()
+    ]
+    if not tokens:
+        tokens = ["stdout"]
+    known = set(_SERIALIZERS) | {"stdout"}
+    unknown = [tok for tok in tokens if tok not in known]
+    if unknown:
+        raise ValueError(
+            f"unknown report format(s): {', '.join(unknown)} "
+            "(choose from: html, json, sarif, stdout)"
+        )
+    if "stdout" in tokens and len(tokens) > 1:
+        raise ValueError("'stdout' cannot be combined with file report formats")
+    formats: list[str] = []
+    for tok in tokens:
+        if tok != "stdout" and tok not in formats:
+            formats.append(tok)
+    return formats
+
+
+def plan_outputs(formats: list[str],
+                 paths: list[str] | None = None) -> list[tuple[str, str]]:
+    """Pair each requested format with an output path.
+
+    ``paths`` (the repeated ``-o/--output`` values) map to formats in order;
+    a format without an explicit path defaults to ``sitadel-report.<fmt>``.
+    Raises ``ValueError`` when more paths than formats are given. With no
+    file formats at all (stdout-only reporting) extra paths are tolerated —
+    the first one stays available as the default export path for the TUI
+    export prompt, matching the historical ``-o`` behaviour.
+    """
+    paths = list(paths or [])
+    if formats and len(paths) > len(formats):
+        raise ValueError(
+            f"got {len(paths)} output path(s) for {len(formats)} report "
+            "format(s); repeat --format or drop the extra -o/--output"
+        )
+    return [
+        (fmt, paths[i] if i < len(paths) else f"sitadel-report.{fmt}")
+        for i, fmt in enumerate(formats)
+    ]

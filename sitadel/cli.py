@@ -18,7 +18,13 @@ from sitadel.utils import banner, manager, output, validator
 from sitadel.utils.container import Services
 from sitadel.model import TargetProfile
 from sitadel.modules.discovery import discover as discover_api
-from sitadel.report import Findings, write_report
+from sitadel.report import (
+    Findings,
+    ReportError,
+    parse_formats,
+    plan_outputs,
+    publish_report,
+)
 from sitadel.request.auth import Authenticator
 from sitadel.utils.datastore import Datastore
 from sitadel.utils.events import EventBus, Phase, RiskLevel
@@ -152,14 +158,18 @@ class Sitadel(object):
             "--config", help="Path to the config file", default="config/config.yml"
         )
         parser.add_argument(
-            "-o", "--output", help="Path to write the findings report to"
+            "-o", "--output", action="append",
+            help="Path to write a findings report to; repeat to map several "
+                 "--format entries in order",
         )
         parser.add_argument(
             "--format",
             dest="report_format",
-            choices=["stdout", "json", "html", "sarif"],
             default="stdout",
-            help="Report format for the findings (default: stdout only)",
+            metavar="FMT[,FMT...]",
+            help="Report format(s) for the findings: stdout, json, html, sarif "
+                 "(comma-separated to write several files atomically; "
+                 "default: stdout only)",
         )
         parser.add_argument(
             "--tui",
@@ -176,6 +186,17 @@ class Sitadel(object):
         )
         parser.add_argument("--version", action="version", version=self.bn.version())
         args = parser.parse_args()
+
+        # Resolve the report plan up front: every requested format and output
+        # path is validated before any scan work, and the scan's findings
+        # snapshot, all output files, and the completion status are published
+        # as one transaction at the end.
+        try:
+            report_outputs = plan_outputs(
+                parse_formats(args.report_format), args.output
+            )
+        except ValueError as err:
+            parser.error(str(err))
 
         # Decide the front-end. The live TUI runs only when explicitly requested
         # *and* attached to a real terminal (piped/CI runs fall back to stdout).
@@ -195,19 +216,22 @@ class Sitadel(object):
             def reporter(fmt: str):
                 """Write the collected findings in ``fmt``; return (path, n)."""
                 findings = Services.get("findings").all()
-                path = args.output or f"sitadel-report.{fmt}"
-                write_report(findings, fmt, path)
+                path = (args.output or [None])[0] or f"sitadel-report.{fmt}"
+                publish_report(findings, [(fmt, path)])
                 return path, len(findings)
 
             # Auto-prompt for a format at the end only when one wasn't already
             # requested on the command line (that path writes the report itself).
             run_tui(
-                lambda: self._execute(args, quiet=True), bus, target, cancel,
+                lambda: self._execute(args, quiet=True,
+                                      report_outputs=report_outputs),
+                bus, target, cancel,
                 reporter=reporter,
-                auto_export=(args.report_format == "stdout"),
+                auto_export=(not report_outputs),
             )
         else:
-            self._execute(args, quiet=False)
+            if not self._execute(args, quiet=False, report_outputs=report_outputs):
+                sys.exit(1)
 
     def _phase(self, name: str) -> None:
         """Announce a scan phase to the event bus (no-op without a TUI)."""
@@ -225,7 +249,34 @@ class Sitadel(object):
         risk = Risk(int(settings.risk))
         bus.publish(RiskLevel(risk.value, risk.name))
 
-    def _execute(self, args, quiet: bool = False):
+    def _publish_reports(self, report_outputs) -> bool:
+        """Publish all report formats as one transaction; return success.
+
+        The findings snapshot, every output file, and the "Wrote N finding(s)"
+        completion lines share a single all-or-nothing publish: on failure the
+        error is reported, no success status is emitted, and no partial or
+        mixed-generation report files are left on disk.
+        """
+        if not report_outputs:
+            return True
+        findings = Services.get("findings").all()
+        try:
+            committed = publish_report(findings, report_outputs)
+        except ReportError as err:
+            Services.get("output").error(f"Report export failed: {err}")
+            return False
+        for path in committed:
+            Services.get("output").info(
+                f"Wrote {len(findings)} finding(s) to {path}"
+            )
+        return True
+
+    def _execute(self, args, quiet: bool = False, report_outputs=None):
+        if report_outputs is None:
+            report_outputs = plan_outputs(
+                parse_formats(args.report_format), args.output
+            )
+
         # Verify the target URL
         self.url = validator.validate_target(args.url)
 
@@ -298,6 +349,7 @@ class Sitadel(object):
         # Display target and scan starting time (the TUI renders its own header).
         if not quiet:
             self.bn.preamble(self.url)
+        report_ok = True
         try:
             # Run the fingerprint modules
             self._phase("fingerprint")
@@ -356,17 +408,15 @@ class Sitadel(object):
         except KeyboardInterrupt:
             raise
         finally:
-            # Write the findings report (console findings are printed live by
-            # Output.finding regardless of the chosen format).
-            if args.report_format != "stdout":
-                findings = Services.get("findings").all()
-                path = args.output or f"sitadel-report.{args.report_format}"
-                write_report(findings, args.report_format, path)
-                Services.get("output").info(
-                    f"Wrote {len(findings)} finding(s) to {path}"
-                )
-            if not quiet:
+            # Publish the findings report(s) and the public completion status
+            # as one transaction: the "Scan Finished" line only prints when
+            # every requested output committed (console findings are printed
+            # live by Output.finding regardless of the chosen format).
+            if not self._publish_reports(report_outputs):
+                report_ok = False
+            if not quiet and report_ok:
                 self.bn.postscript()
+        return report_ok
 
 
 def main():
