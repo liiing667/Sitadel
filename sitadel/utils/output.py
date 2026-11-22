@@ -44,7 +44,8 @@ class Output:
                 confidence: str | None = None, cwe: str | None = None,
                 owasp: str | None = None, wstg: str | None = None,
                 remediation: str | None = None,
-                finding_type: str | None = None) -> None:
+                finding_type: str | None = None,
+                source: str | None = None) -> None:
         r"""Report a finding: print it, log it, and record it for the report.
 
         Only ``value`` is required, so legacy ``finding("text")`` calls keep
@@ -52,7 +53,26 @@ class Output:
         remediation/standards knowledge base (keyed by ``finding_type`` or the
         ``plugin`` name), so even single-string findings gain a sane severity,
         confidence, and CWE/OWASP/WSTG mapping. Explicit arguments always win.
+
+        The finding must belong to the current target transaction: when a
+        :class:`~sitadel.request.scope.TargetScope` is registered and its URL
+        host is out of scope, the finding is refused (debug-logged) so off-host
+        content — e.g. an OpenAPI server on a third-party host, or a redirect
+        chain that wandered — can never reach the report.
         """
+        # Final scope gate for the report itself. Request sending and spec
+        # filtering already enforce the same transaction; this keeps a finding
+        # from ever naming a host the operator did not authorize.
+        try:
+            scope = Services.get("target_scope")
+        except NameError:
+            scope = None
+        if scope is not None and url and scope.denied(url):
+            self.debug(
+                "Refusing out-of-scope finding for %s" % url
+            )
+            return
+
         if not self.quiet:
             print(f"{self.g}[+]{self.e} {self.w}{value}{self.e}", flush=True)
         self.logger.info("FINDING: %s", value)
@@ -76,6 +96,7 @@ class Output:
             owasp=pick(owasp, "owasp"),
             wstg=pick(wstg, "wstg"),
             remediation=pick(remediation, "remediation"),
+            source=source,
         )
 
         # Record for report generation, when a collector is registered.
@@ -105,6 +126,7 @@ class Output:
                     confidence=finding.confidence,
                     cwe=finding.cwe,
                     remediation=finding.remediation,
+                    source=finding.source,
                 )
             )
 

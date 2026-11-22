@@ -6,6 +6,7 @@ import pytest
 import requests
 
 from sitadel.request.request import SingleRequest, _RateLimiter
+from sitadel.request.scope import TargetScope
 from sitadel.utils.container import Services
 from sitadel.utils.output import Output
 
@@ -120,3 +121,46 @@ def test_urlless_construction_is_unrestricted():
     r = _req()
     if r.scope_hosts:
         raise AssertionError("url-less construction must be unrestricted")
+
+
+def test_explicit_scope_transaction_is_shared():
+    scope = TargetScope.from_url("http://target.test/", ["api.target.test"])
+    r = SingleRequest(url="http://target.test/", scope=scope)
+    if r.scope is not scope:
+        raise AssertionError("the request factory must hold the same scope object")
+    if r.scope_hosts != {"target.test", "api.target.test"}:
+        raise AssertionError(r.scope_hosts)
+
+
+class _Authenticator:
+    headers = {}
+    has_login = False
+
+    def __init__(self):
+        self.logins = 0
+
+    def looks_logged_out(self, resp):
+        return True
+
+    def login(self, *a, **k):
+        self.logins += 1
+
+
+def test_re_authentication_retry_cannot_cross_scope():
+    # The retry re-sends the SAME in-scope URL through the scope gate, exactly
+    # once; an out-of-scope URL is still refused before any retry/login.
+    r = _req(url="http://target.test/")
+    auth = _Authenticator()
+    r.set_authenticator(auth)
+    r.session = _FakeSession("http://target.test/x")
+    resp = r.send(url="http://target.test/x")
+    if resp is None or r.session.calls != 2 or auth.logins != 1:
+        raise AssertionError("one in-scope retry after re-login is expected")
+    # An out-of-scope URL never reaches the session, so no retry can happen.
+    r2 = _req(url="http://target.test/")
+    r2.set_authenticator(auth)
+    r2.session = _FakeSession("http://evil.test/")
+    if r2.send(url="http://evil.test/x") is not None:
+        raise AssertionError("out-of-scope request must be skipped pre-retry")
+    if r2.session.calls != 0:
+        raise AssertionError("no HTTP, hence no retry, for an out-of-scope URL")

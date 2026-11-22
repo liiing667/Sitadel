@@ -18,6 +18,7 @@ import json
 from urllib.parse import urlencode, urljoin, urlsplit
 
 from sitadel.modules.attacks.targets import Target
+from sitadel.request.scope import TargetScope, host_of
 
 # Well-known locations a spec is commonly served from.
 SPEC_PATHS = (
@@ -100,17 +101,26 @@ def _schema_params(doc: dict, schema, _depth=0) -> dict:
     return {}
 
 
-def _base_url(doc: dict, origin: str) -> str:
-    """Best-effort base URL from an OpenAPI ``servers`` or Swagger ``basePath``."""
+def _base_url(doc: dict, origin: str) -> tuple[str, bool]:
+    """Best-effort base URL from an OpenAPI ``servers`` or Swagger ``basePath``.
+
+    Returns ``(base_url, external)`` where ``external`` is ``True`` when the
+    spec declared an *absolute* server pointing at another host. A relative
+    server (``/api/v1``) or a Swagger ``basePath`` always resolves against the
+    scanned origin and is therefore never external.
+    """
     servers = doc.get("servers")
     if isinstance(servers, list) and servers:
         url = servers[0].get("url", "") if isinstance(servers[0], dict) else ""
         if url:
-            return url if url.startswith("http") else urljoin(origin + "/", url.lstrip("/"))
+            if url.startswith("http"):
+                external = host_of(url) not in ("", host_of(origin))
+                return url, external
+            return urljoin(origin + "/", url.lstrip("/")), False
     base_path = doc.get("basePath")  # Swagger 2.0
     if isinstance(base_path, str) and base_path:
-        return origin.rstrip("/") + "/" + base_path.strip("/")
-    return origin
+        return origin.rstrip("/") + "/" + base_path.strip("/"), False
+    return origin, False
 
 
 def _endpoint_url(base: str, path: str, query: dict) -> str:
@@ -164,10 +174,35 @@ def _query_params(op: dict) -> dict:
     return query
 
 
-def targets_from_spec(doc: dict, origin: str) -> list[Target]:
-    """Build the list of injectable :class:`Target`s described by ``doc``."""
-    base = _base_url(doc, origin)
+def targets_from_spec(
+    doc: dict,
+    origin: str,
+    scope: TargetScope | None = None,
+    source: str | None = None,
+    output=None,
+) -> list[Target]:
+    """Build the in-scope injectable :class:`Target`s described by ``doc``.
+
+    The same :class:`TargetScope` transaction that gates outgoing requests
+    filters the materialized endpoints *here*, before any attack request is
+    scheduled: an absolute ``servers`` URL on a foreign host (or a path that
+    template expansion resolves onto one) is dropped rather than enumerated.
+    Relative servers, Swagger ``basePath`` and ``{template}`` path variables
+    all resolve against the in-scope origin, so they are retained unchanged.
+    A falsy ``scope`` keeps the legacy unrestricted behavior for direct calls.
+    """
+    base, external = _base_url(doc, origin)
+    if external and scope is not None and scope.denied(base):
+        # The spec itself points at a host outside the target transaction.
+        # Refuse the whole server rather than enumerating its endpoints.
+        if output is not None:
+            output.debug(
+                "Ignoring out-of-scope API server %s declared by spec %s"
+                % (base, source or "?")
+            )
+        return []
     targets: list[Target] = []
+    skipped = 0
     for path, item in doc.get("paths", {}).items():
         if not isinstance(item, dict):
             continue
@@ -177,6 +212,16 @@ def targets_from_spec(doc: dict, origin: str) -> list[Target]:
                 continue
             query = _query_params(op)
             url = _endpoint_url(base, path, query)
+            if scope is not None and scope.denied(url):
+                # Defense in depth: even with an in-scope declared server, no
+                # expansion (path templates, server variables) may escape.
+                skipped += 1
+                if output is not None:
+                    output.debug(
+                        "Skipping out-of-scope endpoint from spec %s: %s %s"
+                        % (source or "?", method.upper(), url)
+                    )
+                continue
             body_format, params = (None, {})
             if method in _BODY_METHODS:
                 body_format, params = _body_format(op, doc)
@@ -186,8 +231,14 @@ def targets_from_spec(doc: dict, origin: str) -> list[Target]:
                     method=method.upper(),
                     body_format=body_format,
                     params=params,
+                    source=source,
                 )
             )
+    if skipped and output is not None:
+        output.info(
+            "API spec %s: %d endpoint(s) excluded as out-of-scope"
+            % (source or "?", skipped)
+        )
     return targets
 
 
@@ -200,6 +251,15 @@ def discover(start_url, request, profile=None, force=False, output=None):
     recorded. Returns a list of ``Target`` (possibly empty).
     """
     origin = _origin(start_url)
+    # Share the request layer's target transaction so spec-derived endpoints
+    # are bounded by exactly the hosts outgoing requests are allowed to touch.
+    # A factory without a scope (legacy/direct construction) falls back to a
+    # scope derived from the scan start URL plus any explicit extra hosts.
+    scope = getattr(request, "scope", None)
+    if scope is None:
+        scope = TargetScope.from_url(
+            start_url, getattr(request, "scope_hosts", None)
+        )
 
     for path in SPEC_PATHS:
         try:
@@ -211,7 +271,9 @@ def discover(start_url, request, profile=None, force=False, output=None):
         doc = _parse_spec(resp.text)
         if doc is None:
             continue
-        targets = targets_from_spec(doc, origin)
+        targets = targets_from_spec(
+            doc, origin, scope=scope, source=path, output=output
+        )
         if profile is not None:
             profile.api_type = "rest"
         if output is not None:

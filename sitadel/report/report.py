@@ -42,6 +42,10 @@ class Finding:
     occurrences: int = 1
     # Extra URLs (beyond ``url``) where the same de-duplicated issue was seen.
     other_urls: list[str] = field(default_factory=list)
+    # Provenance: which producer surfaced the attacked surface (the spec path
+    # for API-discovery targets, "crawler"/"forms", etc.). Keeps a finding
+    # traceable back to the single target transaction that authorized its URL.
+    source: str | None = None
 
 
 def _normalize_url(url: str | None) -> str:
@@ -204,6 +208,7 @@ def to_html(findings: list[Finding]) -> str:
             _html.escape(f.evidence or ""),
             _std_cell(f),
             _html.escape(f.remediation or ""),
+            _html.escape(f.source or ""),
         ]
         sev_class = f"sev-{severity}" if severity else ""
         rows.append(
@@ -211,7 +216,7 @@ def to_html(findings: list[Finding]) -> str:
             + "".join(f"<td>{c}</td>" for c in cells)
             + "</tr>"
         )
-    body = "\n".join(rows) or '<tr><td colspan="9">No findings</td></tr>'
+    body = "\n".join(rows) or '<tr><td colspan="10">No findings</td></tr>'
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<title>Sitadel report</title>"
@@ -226,7 +231,7 @@ def to_html(findings: list[Finding]) -> str:
         f"<h1>Sitadel report</h1><p>{len(findings)} finding(s)</p>"
         "<table><thead><tr><th>Severity</th><th>Confidence</th><th>Title</th>"
         "<th>URL</th><th>Parameter</th><th>Count</th><th>Evidence</th>"
-        "<th>CWE / OWASP / WSTG</th><th>Remediation</th></tr></thead>"
+        "<th>CWE / OWASP / WSTG</th><th>Remediation</th><th>Source</th></tr></thead>"
         f"<tbody>{body}</tbody></table>"
         "</body></html>"
     )

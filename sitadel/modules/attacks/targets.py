@@ -45,6 +45,10 @@ class Target:
     body_format: str | None = None
     params: dict = field(default_factory=dict)
     fixed: dict = field(default_factory=dict)
+    # Where the target came from (e.g. the spec path "openapi.json",
+    # "crawler", "forms"). Flows onto any finding raised against the target so
+    # the report keeps the full provenance chain of a result.
+    source: str | None = None
 
     def describe(self) -> str:
         if self.body_format:

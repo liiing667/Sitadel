@@ -73,6 +73,7 @@ class FindingAdded:
     confidence: str | None = None
     cwe: str | None = None
     remediation: str | None = None
+    source: str | None = None
 
 
 @dataclass

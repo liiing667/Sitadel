@@ -137,3 +137,11 @@ def test_html_shows_evidence_remediation_and_count():
     for needle in ("MySQL syntax error", "Use prepared statements", "CWE-89", "7"):
         if needle not in out:
             raise AssertionError(f"HTML must show {needle!r}")
+
+
+def test_html_shows_finding_source_provenance():
+    f = Finding(title="SQLi", severity=Severity.HIGH,
+                url="http://host/api/login", source="/openapi.json")
+    out = to_html([f])
+    if "<th>Source</th>" not in out or "/openapi.json" not in out:
+        raise AssertionError("HTML report must expose the finding's source")

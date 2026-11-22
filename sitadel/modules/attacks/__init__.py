@@ -157,6 +157,7 @@ class AttackPlugin(metaclass=IPlugin):
                         plugin=type(self).__name__,
                         parameter=parameter,
                         evidence="payload=%s | matched=%s" % (payload, label),
+                        source=getattr(target, "source", None),
                     )
             except Exception as err:
                 logger.error(err)

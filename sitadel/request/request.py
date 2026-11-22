@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 import time
-from urllib.parse import urlsplit
 
 import urllib3
 from requests import ConnectionError, Request, RequestException, Session, Timeout
@@ -10,6 +9,7 @@ from requests.adapters import HTTPAdapter
 from requests.utils import dict_from_cookiejar
 
 from sitadel.utils.container import Services
+from .scope import TargetScope
 from . import ragent as ragent
 
 # Sized to the attack phase's bounded thread pools so connections are reused.
@@ -55,6 +55,7 @@ class SingleRequest:
         verify: bool = False,
         rate_limit: float = 0.0,
         scope_hosts: set | list | None = None,
+        scope: TargetScope | None = None,
     ):
         self.url = url
         self.agent = agent
@@ -70,16 +71,18 @@ class SingleRequest:
         self.rate_limit = float(rate_limit or 0)
         self._limiter = _RateLimiter(self.rate_limit)
 
-        # In-scope hosts. Defaults to the target's host so probes (and followed
-        # redirects) never wander off-target; an empty set means "unrestricted"
-        # (used by direct, url-less construction in tests). Explicit extra hosts
-        # are added for multi-host targets.
-        hosts = {h.lower() for h in (scope_hosts or []) if h}
-        if url:
-            target_host = urlsplit(url).hostname
-            if target_host:
-                hosts.add(target_host.lower())
-        self.scope_hosts = hosts
+        # In-scope hosts: the single target transaction shared with spec
+        # discovery and the finding collector. A caller-supplied ``scope``
+        # (the normal CLI path) is authoritative; otherwise derive one from
+        # ``url`` + explicit ``scope_hosts`` so direct/url-less construction
+        # (largely tests) keeps its legacy behavior, including "empty =>
+        # unrestricted".
+        if scope is None:
+            scope = TargetScope.from_url(url, scope_hosts or [])
+        self.scope = scope
+        # ``scope_hosts`` stays as a plain set for back-compat with callers
+        # and tests that read the attribute directly.
+        self.scope_hosts = set(scope.hosts)
 
         # Reuse one pooled session (keep-alive) across every request instead of
         # opening a fresh TCP/TLS connection per call.
@@ -92,12 +95,7 @@ class SingleRequest:
 
     def _in_scope(self, url: str) -> bool:
         """Whether ``url``'s host is in scope. Empty scope => unrestricted."""
-        if not self.scope_hosts:
-            return True
-        host = (urlsplit(url).hostname or "").lower()
-        # No parseable host (relative/opaque) is treated as in-scope — it can
-        # only resolve against the in-scope base.
-        return (host in self.scope_hosts) if host else True
+        return self.scope.allows(url)
 
     def set_authenticator(self, authenticator):
         self.authenticator = authenticator
@@ -141,7 +139,7 @@ class SingleRequest:
             )
             # A redirect chain may have landed off-scope; never let off-host
             # content feed detection — discard it like a skipped request.
-            if resp is not None and self.scope_hosts and not self._in_scope(resp.url):
+            if resp is not None and self.scope.denied(resp.url):
                 output.debug("Discarding out-of-scope redirect to %s" % resp.url)
                 return None
             # If the session dropped (login page returned), re-authenticate once

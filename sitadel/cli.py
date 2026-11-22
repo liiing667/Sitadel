@@ -14,6 +14,7 @@ from sitadel import __version__
 from sitadel.config import settings
 from sitadel.config.settings import Risk
 from sitadel.request.request import SingleRequest
+from sitadel.request.scope import TargetScope
 from sitadel.utils import banner, manager, output, validator
 from sitadel.utils.container import Services
 from sitadel.model import TargetProfile
@@ -248,6 +249,10 @@ class Sitadel(object):
         scope_hosts = list(http_cfg.get("scope_hosts", []) or [])
         if args.scope_hosts:
             scope_hosts.extend(args.scope_hosts)
+        # The single target transaction of this scan: the same immutable host
+        # allow-list drives the request factory, API-spec endpoint filtering
+        # and the finding collector so no stage can wander off-target.
+        target_scope = TargetScope.from_url(self.url, scope_hosts)
 
         # Register services
         Services.register("datastore", Datastore(settings.datastore))
@@ -255,6 +260,7 @@ class Sitadel(object):
         Services.register("output", Output(args.verbosity, quiet=quiet))
         Services.register("findings", Findings())
         Services.register("profile", TargetProfile())
+        Services.register("target_scope", target_scope)
         Services.register(
             "request_factory",
             SingleRequest(
@@ -267,6 +273,7 @@ class Sitadel(object):
                 verify=args.verify,
                 rate_limit=rate_limit,
                 scope_hosts=scope_hosts,
+                scope=target_scope,
             ),
         )
 
