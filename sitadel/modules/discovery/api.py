@@ -17,7 +17,8 @@ from __future__ import annotations
 import json
 from urllib.parse import urlencode, urljoin, urlsplit
 
-from sitadel.modules.attacks.targets import Target
+from sitadel.modules.attacks.targets import Target, TargetLedger
+from sitadel.utils.container import Services
 
 # Well-known locations a spec is commonly served from.
 SPEC_PATHS = (
@@ -164,8 +165,19 @@ def _query_params(op: dict) -> dict:
     return query
 
 
-def targets_from_spec(doc: dict, origin: str) -> list[Target]:
-    """Build the list of injectable :class:`Target`s described by ``doc``."""
+def targets_from_spec(
+    doc: dict,
+    origin: str,
+    source_url: str | None = None,
+) -> list[Target]:
+    """Build the list of injectable :class:`Target`s described by ``doc``.
+
+    A target's parameter location is explicit.  When one operation has both
+    query and body parameters we emit two targets with the same endpoint and
+    method: one query target and one body target.  That keeps injection and
+    finding attribution unambiguous instead of treating whichever parameters
+    happened to be in the URL as the body.
+    """
     base = _base_url(doc, origin)
     targets: list[Target] = []
     for path, item in doc.get("paths", {}).items():
@@ -180,18 +192,41 @@ def targets_from_spec(doc: dict, origin: str) -> list[Target]:
             body_format, params = (None, {})
             if method in _BODY_METHODS:
                 body_format, params = _body_format(op, doc)
-            targets.append(
-                Target(
-                    url=url,
-                    method=method.upper(),
-                    body_format=body_format,
-                    params=params,
+
+            # A body target keeps any query parameters as fixed server inputs;
+            # only its own body params are tainted by the body probe.
+            if body_format is not None:
+                targets.append(
+                    Target(
+                        url=url,
+                        method=method.upper(),
+                        body_format=body_format,
+                        params=params,
+                        location="body",
+                        source="api",
+                        source_url=source_url,
+                    )
                 )
-            )
+
+            # Query parameters get their own probe, including on POST/PUT/etc.
+            # A GET operation without parameters still yields a (skipped)
+            # target for compatibility with the old target count/shape.
+            if query or body_format is None:
+                targets.append(
+                    Target(
+                        url=url,
+                        method=method.upper(),
+                        params={},
+                        location="query",
+                        source="api",
+                        source_url=source_url,
+                    )
+                )
     return targets
 
 
-def discover(start_url, request, profile=None, force=False, output=None):
+def discover(start_url, request, profile=None, force=False, output=None,
+             ledger=None):
     """Discover API targets for ``start_url``.
 
     Fetches a spec from the well-known locations; on success returns the
@@ -200,6 +235,14 @@ def discover(start_url, request, profile=None, force=False, output=None):
     recorded. Returns a list of ``Target`` (possibly empty).
     """
     origin = _origin(start_url)
+    if ledger is None:
+        # A crawl in this scan registers its TargetLedger; reuse it so API
+        # targets advance the same generation sequence rather than starting a
+        # second, unrelated catalog.
+        try:
+            ledger = Services.get("target_ledger")
+        except NameError:
+            ledger = None
 
     for path in SPEC_PATHS:
         try:
@@ -211,7 +254,14 @@ def discover(start_url, request, profile=None, force=False, output=None):
         doc = _parse_spec(resp.text)
         if doc is None:
             continue
-        targets = targets_from_spec(doc, origin)
+        spec_url = origin + path
+        targets = targets_from_spec(doc, origin, source_url=spec_url)
+        # Always run the spec through a ledger so discovered targets carry a
+        # generation even when this function is called directly.  A caller
+        # scanning a page can pass its shared ledger to keep page and API
+        # target generations in one catalog.
+        target_ledger = ledger if ledger is not None else TargetLedger()
+        targets = target_ledger.record_api(spec_url, targets)
         if profile is not None:
             profile.api_type = "rest"
         if output is not None:

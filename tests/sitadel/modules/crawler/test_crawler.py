@@ -5,10 +5,27 @@ from urllib.parse import urlsplit
 
 import pytest
 
+import sitadel.modules.crawler.crawler as crawler_module
 from sitadel.config import settings
 from sitadel.modules.crawler.crawler import crawl, url_signature
 from sitadel.utils.container import Services
 from sitadel.utils.output import Output
+
+
+@pytest.fixture(autouse=True)
+def _clean_target_snapshot():
+    """A crawl snapshot is process-global; do not leak it between tests."""
+    try:
+        yield
+    finally:
+        for key in (
+            "page_targets",
+            "form_targets",
+            "api_targets",
+            "target_generation",
+            "target_ledger",
+        ):
+            Services.services.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +52,58 @@ def test_signature_ignore_params():
     b = url_signature("http://host/p?id=1", ignore_params=("utm_source",))
     if a != b:
         raise AssertionError
+
+
+def test_crawl_snapshot_retires_get_link_when_page_becomes_post(monkeypatch):
+    """The same crawl sees /item as a GET link then as a POST form."""
+    pages = {
+        "http://host/": '<a href="/item?id=1">item</a>',
+        "http://host/item?id=1": (
+            '<form action="/item" method="post">'
+            '<input name="name" type="text"></form>'
+        ),
+    }
+
+    async def _fetch(_session, url, _timeout):
+        return pages.get(url)
+
+    class _Session:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    class _Connector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(crawler_module, "_fetch", _fetch)
+    monkeypatch.setattr(crawler_module.aiohttp, "ClientSession", _Session)
+    monkeypatch.setattr(crawler_module.aiohttp, "TCPConnector", _Connector)
+
+    cfg = dict(crawler_module._DEFAULTS)
+    cfg.update({"max_depth": 3, "max_pages": 10, "concurrency": 2})
+    try:
+        urls, targets, _bodies = crawler_module.asyncio.run(
+            crawler_module._crawl("http://host/", "test-agent", cfg)
+        )
+    finally:
+        Services.services.pop("target_ledger", None)
+
+    if "http://host/item?id=1" not in urls:
+        raise AssertionError("the page should still be crawled")
+    item_targets = [t for t in targets if t.endpoint == "http://host/item"]
+    if len(item_targets) != 1:
+        raise AssertionError(f"only the current shape may survive: {item_targets}")
+    target = item_targets[0]
+    if target.method != "POST" or target.location != "body":
+        raise AssertionError((target.method, target.location))
+    if target.parameter_label != "name":
+        raise AssertionError(target.parameter_label)
 
 
 # ---------------------------------------------------------------------------

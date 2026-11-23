@@ -24,8 +24,11 @@ class Finding:
     ``evidence`` (payload + matched marker), a standards mapping
     (``cwe``/``owasp``/``wstg``), ``remediation`` guidance, and an
     ``occurrences`` count maintained by :class:`Findings` when the same issue
-    is reported for many URLs. Every field except ``title`` is optional so
-    plugins can enrich incrementally.
+    is reported for many URLs. Target provenance (``endpoint``/``method``/
+    ``parameter_location``/``source``/``source_url``/``target_id``/
+    ``generation``) keeps the report on the same target shape as the request
+    that produced it. Every field except ``title`` is optional so plugins can
+    enrich incrementally.
     """
 
     title: str
@@ -42,6 +45,32 @@ class Finding:
     occurrences: int = 1
     # Extra URLs (beyond ``url``) where the same de-duplicated issue was seen.
     other_urls: list[str] = field(default_factory=list)
+    # Target provenance.  These fields keep the report's attribution on the
+    # same target generation as the request that produced the finding: a GET
+    # query parameter and a POST body parameter on one path are different
+    # findings, even when they share a name.
+    endpoint: str | None = None
+    method: str | None = None
+    parameter_location: str | None = None
+    source: str | None = None
+    source_url: str | None = None
+    target_id: str | None = None
+    generation: int | None = None
+
+    @property
+    def location(self) -> str | None:
+        """Alias for :attr:`parameter_location`."""
+        return self.parameter_location
+
+    @property
+    def target_source(self) -> str | None:
+        """Alias for :attr:`source`."""
+        return self.source
+
+    @property
+    def target_generation(self) -> int | None:
+        """Alias for :attr:`generation`."""
+        return self.generation
 
 
 def _normalize_url(url: str | None) -> str:
@@ -57,14 +86,24 @@ def _normalize_url(url: str | None) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def _signature(finding: Finding) -> tuple[str, str, str]:
-    """Stable dedup key: (type, normalized-url, parameter).
+def _signature(finding: Finding) -> tuple:
+    """Stable dedup key: type, endpoint, parameter and target shape.
 
     ``type`` prefers the plugin name (stable per attack class) and falls back
-    to the title so findings without a plugin still de-duplicate sanely.
+    to the title so findings without a plugin still de-duplicate sanely.  The
+    method/location/target-id components prevent a GET query finding and a POST
+    body finding (or two different body encodings) from collapsing together.
     """
     ftype = (finding.plugin or finding.title or "").strip().lower()
-    return (ftype, _normalize_url(finding.url), (finding.parameter or ""))
+    endpoint = _normalize_url(finding.endpoint or finding.url)
+    return (
+        ftype,
+        endpoint,
+        (finding.parameter or ""),
+        str(finding.method or "").upper(),
+        str(finding.parameter_location or "").lower(),
+        finding.target_id or "",
+    )
 
 
 class Findings:
@@ -77,7 +116,7 @@ class Findings:
 
     def __init__(self):
         self._items: list[Finding] = []
-        self._index: dict[tuple[str, str, str], Finding] = {}
+        self._index: dict[tuple, Finding] = {}
 
     def add(self, finding: Finding) -> None:
         sig = _signature(finding)
@@ -107,6 +146,9 @@ def _to_dict(finding: Finding) -> dict:
         if isinstance(finding.severity, Severity)
         else finding.severity
     )
+    # Friendly alias used by external consumers that only know the concept of
+    # a parameter "location" rather than the storage field name.
+    data["location"] = data.get("parameter_location")
     return data
 
 
@@ -162,6 +204,20 @@ def to_sarif(findings: list[Finding]) -> str:
             props["occurrences"] = f.occurrences
         if f.evidence:
             props["evidence"] = f.evidence
+        if f.parameter:
+            props["parameter"] = f.parameter
+        if f.parameter_location:
+            props["parameterLocation"] = f.parameter_location
+        if f.method:
+            props["method"] = f.method
+        if f.source:
+            props["source"] = f.source
+        if f.source_url:
+            props["sourceUrl"] = f.source_url
+        if f.target_id:
+            props["targetId"] = f.target_id
+        if f.generation is not None:
+            props["generation"] = f.generation
         if props:
             result["properties"] = props
         if f.url:
@@ -200,6 +256,10 @@ def to_html(findings: list[Finding]) -> str:
             _html.escape(f.title or ""),
             _html.escape(f.url or ""),
             _html.escape(f.parameter or ""),
+            _html.escape(f.method or ""),
+            _html.escape(f.parameter_location or ""),
+            _html.escape(f.source or ""),
+            _html.escape(f.source_url or ""),
             occ,
             _html.escape(f.evidence or ""),
             _std_cell(f),
@@ -211,7 +271,7 @@ def to_html(findings: list[Finding]) -> str:
             + "".join(f"<td>{c}</td>" for c in cells)
             + "</tr>"
         )
-    body = "\n".join(rows) or '<tr><td colspan="9">No findings</td></tr>'
+    body = "\n".join(rows) or '<tr><td colspan="13">No findings</td></tr>'
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<title>Sitadel report</title>"
@@ -225,7 +285,8 @@ def to_html(findings: list[Finding]) -> str:
         "</style></head><body>"
         f"<h1>Sitadel report</h1><p>{len(findings)} finding(s)</p>"
         "<table><thead><tr><th>Severity</th><th>Confidence</th><th>Title</th>"
-        "<th>URL</th><th>Parameter</th><th>Count</th><th>Evidence</th>"
+        "<th>URL</th><th>Parameter</th><th>Method</th><th>Location</th>"
+        "<th>Source</th><th>Source URL</th><th>Count</th><th>Evidence</th>"
         "<th>CWE / OWASP / WSTG</th><th>Remediation</th></tr></thead>"
         f"<tbody>{body}</tbody></table>"
         "</body></html>"

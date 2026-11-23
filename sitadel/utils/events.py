@@ -73,6 +73,13 @@ class FindingAdded:
     confidence: str | None = None
     cwe: str | None = None
     remediation: str | None = None
+    endpoint: str | None = None
+    method: str | None = None
+    parameter_location: str | None = None
+    source: str | None = None
+    source_url: str | None = None
+    target_id: str | None = None
+    generation: int | None = None
 
 
 @dataclass

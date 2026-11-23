@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from sitadel.model import TargetProfile
+from sitadel.modules.attacks.targets import Target, TargetLedger
 from sitadel.modules.discovery import discover
 from sitadel.modules.discovery.api import _parse_spec, targets_from_spec
 from sitadel.request.request import SingleRequest
@@ -91,6 +92,73 @@ def test_targets_from_swagger2_body_param():
         raise AssertionError
 
 
+def test_targets_from_spec_keep_query_and_body_locations_distinct():
+    spec = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/items": {
+                "post": {
+                    "parameters": [{"in": "query", "name": "filter"}],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "properties": {"name": {}}
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    }
+
+    targets = targets_from_spec(spec, "http://h", source_url="http://h/spec")
+    assert len(targets) == 2
+    body = next(t for t in targets if t.location == "body")
+    query = next(t for t in targets if t.location == "query")
+    assert body.method == query.method == "POST"
+    assert body.body_format == "json"
+    assert body.params == {"name": "1"}
+    assert query.body_format is None
+    assert query.query_parameter_names == ("filter",)
+    assert body.source == query.source == "api"
+    assert body.source_url == query.source_url == "http://h/spec"
+    assert body.identity != query.identity
+
+
+def test_discover_uses_the_crawl_target_ledger_generation():
+    class _Response:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        text = json.dumps(OAS3)
+
+    class _NotFound:
+        status_code = 404
+        headers = {"Content-Type": "text/html"}
+        text = "not found"
+
+    class _Request:
+        def send(self, url, method="GET"):
+            return _Response() if url.endswith("/openapi.json") else _NotFound()
+
+    ledger = TargetLedger()
+    page_targets = ledger.record_page("http://h/page", [
+        Target(url="http://h/page?q=1", source="page"),
+    ])
+    page_generation = page_targets[0].generation
+
+    targets = discover(
+        "http://h", _Request(), profile=TargetProfile(), ledger=ledger
+    )
+
+    assert targets
+    assert all(target.generation > page_generation for target in targets)
+    snapshot = ledger.snapshot()
+    assert any(target.source == "page" for target in snapshot)
+    assert any(target.source == "api" for target in snapshot)
+
+
 # --------------------------------------------------------------------------- #
 # Integration: spec served over HTTP + a SQL-vulnerable JSON endpoint
 # --------------------------------------------------------------------------- #
@@ -155,7 +223,8 @@ def api_site():
     finally:
         server.shutdown()
         server.server_close()
-        Services.services.pop("api_targets", None)
+        for key in ("api_targets", "target_ledger"):
+            Services.services.pop(key, None)
 
 
 def test_discover_finds_spec_and_sets_profile(api_site):

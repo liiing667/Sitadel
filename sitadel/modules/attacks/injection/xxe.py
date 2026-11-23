@@ -66,6 +66,13 @@ class Xxe(AttackPlugin):
                     url=target.url,
                     plugin="Xxe",
                     parameter=",".join(target.params) or None,
+                    endpoint=target.endpoint,
+                    method=method,
+                    parameter_location=target.location,
+                    source=target.source,
+                    source_url=target.source_url,
+                    target_id=target.target_id,
+                    generation=target.generation,
                     evidence="external entity SYSTEM %s reflected file contents"
                              % uri,
                     finding_type="xxe",

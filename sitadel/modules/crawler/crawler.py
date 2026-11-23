@@ -8,7 +8,11 @@ from requests.utils import dict_from_cookiejar
 from selectolax.lexbor import LexborHTMLParser
 
 from sitadel.config import settings
-from sitadel.modules.attacks.targets import Target
+from sitadel.modules.attacks.targets import (
+    Target,
+    TargetLedger,
+    endpoint_of_url,
+)
 from sitadel.utils.container import Services
 from sitadel.utils.events import PageDiscovered
 
@@ -67,23 +71,46 @@ def _auth_context():
     return headers, cookies
 
 
-def url_signature(url: str, ignore_params=()) -> tuple:
+def url_signature(
+    url: str,
+    ignore_params=(),
+    *,
+    method: str = "GET",
+    location: str = "query",
+    body_format: str | None = None,
+    params=(),
+) -> tuple:
     """Signature that collapses URLs differing only in query-parameter *values*.
 
     Two URLs sharing scheme, host, path and the same set of parameter *names* map to
     the same signature, so ``?id=1`` and ``?id=2`` are one endpoint shape. This is what
     keeps parameter permutations from exploding the crawl frontier, while still keeping a
     representative (parameterized) URL per shape for the attack phase to inject into.
+
+    A target's method/parameter location/body encoding is part of the signature
+    too, so a page that changes from GET/query to POST/body is a new shape rather
+    than a value variation of the old one.
     """
     parts = urlsplit(url)
-    keys = tuple(
-        sorted(
-            key
-            for key, _ in parse_qsl(parts.query, keep_blank_values=True)
-            if key not in ignore_params
+    if location == "body":
+        keys = tuple(sorted(str(key) for key in params if key not in ignore_params))
+    else:
+        keys = tuple(
+            sorted(
+                key
+                for key, _ in parse_qsl(parts.query, keep_blank_values=True)
+                if key not in ignore_params
+            )
         )
+    return (
+        parts.scheme.lower(),
+        parts.netloc.lower(),
+        parts.path,
+        str(method or "GET").upper(),
+        str(location or "query").lower(),
+        str(body_format or "").lower(),
+        keys,
     )
-    return (parts.scheme.lower(), parts.netloc.lower(), parts.path, keys)
 
 
 def _extract_links(base_url: str, html: str) -> list[str]:
@@ -113,7 +140,12 @@ _MAX_BODY = 512 * 1024
 _SKIP_INPUT_TYPES = {"submit", "button", "image", "reset"}
 
 
-def _extract_forms(base_url: str, html: str, host: str) -> list[Target]:
+def _extract_forms(
+    base_url: str,
+    html: str,
+    host: str,
+    page_url: str | None = None,
+) -> list[Target]:
     """Turn each same-host ``<form>`` into an injectable :class:`Target`.
 
     User-controllable fields become tainted ``params``; hidden fields (incl.
@@ -121,6 +153,10 @@ def _extract_forms(base_url: str, html: str, host: str) -> list[Target]:
     names into the query so the shared ``taint_url`` path handles them; POST
     forms become url-encoded body targets. Multipart / file-upload forms are
     skipped for now (the body encoder has no multipart support).
+
+    Each target records the page that produced it.  That provenance lets a
+    later snapshot of the same page retire an old retry-era GET target instead
+    of leaving its query parameters in the attack profile.
     """
     tree = LexborHTMLParser(html)
     base = base_url
@@ -170,7 +206,8 @@ def _extract_forms(base_url: str, html: str, host: str) -> list[Target]:
         if method == "POST":
             targets.append(Target(
                 url=action, method="POST", body_format="form",
-                params=injectable, fixed=fixed,
+                params=injectable, fixed=fixed, location="body",
+                source="form", source_url=page_url or base_url,
             ))
         else:
             # GET form: fields live in the query string; taint_url skips the
@@ -179,6 +216,8 @@ def _extract_forms(base_url: str, html: str, host: str) -> list[Target]:
             url = action + ("?" + urlencode(query) if query else "")
             targets.append(Target(
                 url=url, method="GET", params=injectable, fixed=fixed,
+                location="query", source="form",
+                source_url=page_url or base_url,
             ))
     return targets
 
@@ -188,7 +227,7 @@ def form_signature(target: Target) -> tuple:
     parts = urlsplit(target.url)
     names = tuple(sorted(list(target.params) + list(target.fixed)))
     return (parts.scheme.lower(), parts.netloc.lower(), parts.path,
-            target.method, target.body_format, names)
+            target.method, target.location, target.body_format, names)
 
 
 async def _fetch(session: aiohttp.ClientSession, url: str, timeout: int) -> str | None:
@@ -216,9 +255,10 @@ async def _crawl(start_url: str, user_agent: str, cfg: dict) -> list[str]:
 
     seen = {url_signature(start_url, ignore)}
     results = {start_url}
-    # Discovered HTML forms, de-duplicated by their shape (see form_signature).
-    forms: list[Target] = []
-    form_seen: set = set()
+    # Versioned snapshot of every target observed while crawling.  Complete
+    # page snapshots let a later observation replace an older shape instead of
+    # accumulating stale GET/query targets from a previous page generation.
+    ledger = TargetLedger()
     # Fetched page bodies (truncated), reused by the passive secret scanner so
     # it need not re-fetch every crawled page.
     bodies: dict[str, str] = {}
@@ -253,29 +293,58 @@ async def _crawl(start_url: str, user_agent: str, cfg: dict) -> list[str]:
                         bodies[url] = html[:_MAX_BODY]
                     # Collect forms on every fetched page (leaves included), so
                     # a form at max depth is still discovered.
-                    for target in _extract_forms(url, html, host):
-                        sig = form_signature(target)
-                        if sig in form_seen:
-                            continue
-                        form_seen.add(sig)
-                        forms.append(target)
+                    page_targets = _extract_forms(
+                        url, html, host, page_url=url
+                    )
+                    for target in page_targets:
                         _publish(PageDiscovered(target.url, is_form=True))
-                    if depth >= max_depth:
-                        continue
-                    for link in _extract_links(url, html):
-                        if urlsplit(link).hostname != host:
-                            continue
-                        sig = url_signature(link, ignore)
-                        if sig in seen:
-                            continue
-                        seen.add(sig)
-                        # Cap the number of discovered pages. No await between the
-                        # check and the add, so this stays consistent across workers.
-                        if len(results) >= max_pages:
-                            continue
-                        results.add(link)
-                        _publish(PageDiscovered(link))
-                        queue.put_nowait((link, depth + 1))
+
+                    # The page itself and its in-scope links are GET/query
+                    # candidates.  If the current page exposes a form on the
+                    # same endpoint, that form is the authoritative shape and
+                    # the generic GET target is skipped.
+                    represented = {target.endpoint for target in page_targets}
+                    own_endpoint = endpoint_of_url(url)
+                    if own_endpoint not in represented:
+                        page_targets.append(Target(
+                            url=url,
+                            method="GET",
+                            location="query",
+                            source="page",
+                            source_url=url,
+                        ))
+
+                    if depth < max_depth:
+                        for link in _extract_links(url, html):
+                            if urlsplit(link).hostname != host:
+                                continue
+                            link_target = Target(
+                                url=link,
+                                method="GET",
+                                location="query",
+                                source="crawl",
+                                source_url=url,
+                            )
+                            if link_target.endpoint not in represented:
+                                page_targets.append(link_target)
+                            sig = url_signature(link, ignore)
+                            if sig in seen:
+                                continue
+                            seen.add(sig)
+                            # Cap the number of discovered pages. No await between
+                            # the check and the add, so this stays consistent across
+                            # workers.
+                            if len(results) >= max_pages:
+                                continue
+                            results.add(link)
+                            _publish(PageDiscovered(link))
+                            queue.put_nowait((link, depth + 1))
+
+                    # Record this page as one complete generation.  Retrying the
+                    # same page with a different method/body replaces its old
+                    # target shape and retires an earlier generic GET target for
+                    # the same endpoint.
+                    ledger.record_page(url, page_targets)
                 except Exception:
                     pass
                 finally:
@@ -287,25 +356,50 @@ async def _crawl(start_url: str, user_agent: str, cfg: dict) -> list[str]:
             task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
 
-    return sorted(results), forms, bodies
+    # Keep the private return shape stable for callers that unpack three
+    # values, while making the versioned catalog available to later phases.
+    Services.register("target_ledger", ledger)
+    return sorted(results), ledger.snapshot(), bodies
 
 
 def crawl(url, user_agent):
     output = Services.get("output")
     output.info("Start crawling the target website")
-    urls, form_targets, page_bodies = asyncio.run(
+    # Each crawl call establishes a new target snapshot; never let a prior
+    # scan's page/API targets leak into this one.
+    for key in (
+        "page_targets",
+        "target_generation",
+        "target_ledger",
+        "form_targets",
+        "api_targets",
+    ):
+        Services.services.pop(key, None)
+    urls, page_targets, page_bodies = asyncio.run(
         _crawl(str(url), user_agent, _config())
     )
+    # ``_crawl`` registers the versioned catalog for API discovery and the
+    # attack phase; it is the same object that produced ``page_targets``.
     # Expose the fetched page bodies for the passive secret scanner (registered
     # as a side effect like ``form_targets``, so re-fetching is unnecessary).
     if page_bodies:
         Services.register("page_bodies", page_bodies)
-    # Register discovered forms as injectable targets, mirroring how API
-    # discovery registers ``api_targets``; ``build_targets`` extends with them.
-    # The public return stays ``list[str]`` so existing callers are unaffected.
+    # Register the complete, versioned crawl target snapshot.  The attack phase
+    # prefers this over reconstructing GET targets from ``crawled_urls`` so a
+    # page that changed from GET/query to POST/body cannot contribute both
+    # shapes.  ``form_targets`` remains for compatibility with older callers.
+    if page_targets:
+        Services.register("page_targets", page_targets)
+        Services.register(
+            "target_generation",
+            max(target.generation for target in page_targets),
+        )
+    form_targets = [t for t in page_targets if t.source == "form"]
     if form_targets:
         Services.register("form_targets", form_targets)
         output.info(
             "Crawler discovered %d HTML form target(s)" % len(form_targets)
         )
+    else:
+        Services.services.pop("form_targets", None)
     return urls

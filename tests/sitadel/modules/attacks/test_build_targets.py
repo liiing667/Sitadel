@@ -9,7 +9,7 @@ from sitadel.utils.container import Services
 @pytest.fixture(autouse=True)
 def _clean():
     yield
-    for k in ("api_targets", "form_targets"):
+    for k in ("api_targets", "form_targets", "page_targets", "target_generation"):
         Services.services.pop(k, None)
 
 

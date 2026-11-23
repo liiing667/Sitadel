@@ -345,7 +345,8 @@ class SitadelApp(App):
                 "severity": sev,
                 "plugin": ev.plugin or "",
                 "count": 0,
-                "urls": {},  # (endpoint, param) → True (for de-dup + display)
+                # (endpoint, method, location, param) → True
+                "urls": {},
                 "node": None,
                 # Representative triage detail (first occurrence) for the modal.
                 "evidence": ev.evidence,
@@ -355,13 +356,18 @@ class SitadelApp(App):
             }
             self._groups[label] = group
         group["count"] += 1
-        # Collapse to the endpoint (path only) + parameter: the finding URL is
-        # the payload-tainted attack URL, so many payloads on one endpoint would
-        # otherwise show as many distinct rows. (endpoint, param) is the natural
-        # per-URL identity — matching the report's de-duplication.
-        endpoint = _endpoint(ev.url)
+        # Collapse to endpoint shape + parameter: the finding URL is the
+        # payload-tainted attack URL, so many payloads on one shape would
+        # otherwise show as many distinct rows.  Method/location are part of
+        # the identity so GET/query and POST/body remain separate.
+        endpoint = _endpoint(ev.endpoint or ev.url)
         if endpoint:
-            group["urls"][(endpoint, ev.parameter or "")] = True
+            group["urls"][(
+                endpoint,
+                (ev.method or "").upper(),
+                (ev.parameter_location or "").lower(),
+                ev.parameter or "",
+            )] = True
 
         if self._group_visible(group):
             self._sync_group_node(label, group)
@@ -372,7 +378,10 @@ class SitadelApp(App):
         if self._filter is not None and group["severity"] != self._filter:
             return False
         if self._endpoint_filter is not None:
-            return any(self._ep_match(ep) for (ep, _p) in group["urls"])
+            return any(
+                self._ep_match(_url_key_parts(key)[0])
+                for key in group["urls"]
+            )
         return True
 
     def _ep_match(self, endpoint: str) -> bool:
@@ -391,16 +400,18 @@ class SitadelApp(App):
         else:
             group["node"].set_label(_group_text(label, group))
         node = group["node"]
-        # Add any (endpoint, param) children not yet shown, honouring the
+        # Add any target-shape children not yet shown, honouring the
         # endpoint filter set by clicking a crawl-tree node.
         shown = {getattr(c, "_sitadel_url", None) for c in node.children}
-        for (endpoint, param) in group["urls"]:
+        for key in group["urls"]:
+            endpoint, method, location, param = _url_key_parts(key)
             if not self._ep_match(endpoint):
                 continue
-            if (endpoint, param) in shown:
+            key = (endpoint, method, location, param)
+            if key in shown:
                 continue
-            child = node.add_leaf(_url_text(endpoint, param))
-            child._sitadel_url = (endpoint, param)  # type: ignore[attr-defined]
+            child = node.add_leaf(_url_text(endpoint, method, location, param))
+            child._sitadel_url = key  # type: ignore[attr-defined]
 
     def _rebuild_findings(self) -> None:
         """Full rebuild of the findings pane (used on filter change)."""
@@ -595,8 +606,12 @@ def _detail_text(label: str, group: dict) -> Text:
     row("Occurrences", str(group.get("count") or ""))
     text.append("\n")
     text.append("Endpoints\n", style="dim")
-    for (endpoint, param) in group["urls"]:
+    for key in group["urls"]:
+        endpoint, method, location, param = _url_key_parts(key)
         text.append(f"  {endpoint}", style="cyan")
+        shape = " ".join(part for part in (method, location) if part)
+        if shape:
+            text.append(f"  [{shape}]", style="dim")
         text.append(f"  · {param}\n" if param else "\n", style="yellow")
     if group.get("evidence"):
         text.append("\nEvidence\n", style="dim")
@@ -620,11 +635,28 @@ def _group_text(label: str, group: dict) -> Text:
     return text
 
 
-def _url_text(rel: str, param: str) -> Text:
+def _url_text(rel: str, method: str, location: str, param: str) -> Text:
     text = Text(rel, style="cyan")
+    shape = " ".join(part for part in (method, location) if part)
+    if shape:
+        text.append(f"  [{shape}]", style="dim")
     if param:
         text.append(f"  · {param}", style="yellow")
     return text
+
+
+def _url_key_parts(key) -> tuple[str, str, str, str]:
+    """Normalize old/new finding URL keys for display.
+
+    Older callers/tests store ``(endpoint, param)``; new findings store
+    ``(endpoint, method, location, param)``.  Keeping both readable makes the
+    detail renderer backwards compatible.
+    """
+    if len(key) == 2:
+        endpoint, param = key
+        return endpoint, "", "", param
+    endpoint, method, location, param = key
+    return endpoint, method, location, param
 
 
 def _path_key(url: str) -> str:

@@ -255,6 +255,16 @@ class Sitadel(object):
         Services.register("output", Output(args.verbosity, quiet=quiet))
         Services.register("findings", Findings())
         Services.register("profile", TargetProfile())
+        # Target snapshots belong to one scan.  Clear any prior run's
+        # page/form/API surface before this scan establishes a new generation.
+        for target_service in (
+            "page_targets",
+            "form_targets",
+            "api_targets",
+            "target_generation",
+            "target_ledger",
+        ):
+            Services.services.pop(target_service, None)
         Services.register(
             "request_factory",
             SingleRequest(

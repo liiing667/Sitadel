@@ -44,7 +44,14 @@ class Output:
                 confidence: str | None = None, cwe: str | None = None,
                 owasp: str | None = None, wstg: str | None = None,
                 remediation: str | None = None,
-                finding_type: str | None = None) -> None:
+                finding_type: str | None = None,
+                endpoint: str | None = None,
+                method: str | None = None,
+                parameter_location: str | None = None,
+                source: str | None = None,
+                source_url: str | None = None,
+                target_id: str | None = None,
+                generation: int | None = None) -> None:
         r"""Report a finding: print it, log it, and record it for the report.
 
         Only ``value`` is required, so legacy ``finding("text")`` calls keep
@@ -76,6 +83,13 @@ class Output:
             owasp=pick(owasp, "owasp"),
             wstg=pick(wstg, "wstg"),
             remediation=pick(remediation, "remediation"),
+            endpoint=endpoint,
+            method=method,
+            parameter_location=parameter_location,
+            source=source,
+            source_url=source_url,
+            target_id=target_id,
+            generation=generation,
         )
 
         # Record for report generation, when a collector is registered.
@@ -101,6 +115,13 @@ class Output:
                     url=finding.url,
                     plugin=finding.plugin,
                     parameter=finding.parameter,
+                    endpoint=finding.endpoint,
+                    method=finding.method,
+                    parameter_location=finding.parameter_location,
+                    source=finding.source,
+                    source_url=finding.source_url,
+                    target_id=finding.target_id,
+                    generation=finding.generation,
                     evidence=finding.evidence,
                     confidence=finding.confidence,
                     cwe=finding.cwe,

@@ -97,6 +97,71 @@ def test_dedup_keeps_distinct_types_and_params_separate():
         raise AssertionError("distinct type/param/endpoint must not collapse")
 
 
+def test_dedup_keeps_query_and_body_shapes_separate():
+    coll = Findings()
+    coll.add(Finding(
+        title="SQLi", plugin="Sql", parameter="id", url="http://host/item?id=1",
+        endpoint="http://host/item", method="GET",
+        parameter_location="query", source="crawl", target_id="query-shape",
+    ))
+    coll.add(Finding(
+        title="SQLi", plugin="Sql", parameter="id", url="http://host/item",
+        endpoint="http://host/item", method="POST",
+        parameter_location="body", source="form", target_id="body-shape",
+    ))
+    # Same shape, different payload value: still one finding.
+    coll.add(Finding(
+        title="SQLi", plugin="Sql", parameter="id", url="http://host/item?id=2",
+        endpoint="http://host/item", method="GET",
+        parameter_location="query", source="crawl", target_id="query-shape",
+    ))
+
+    if len(coll) != 2:
+        raise AssertionError("GET/query and POST/body findings must not collapse")
+    query = next(f for f in coll.all() if f.parameter_location == "query")
+    body = next(f for f in coll.all() if f.parameter_location == "body")
+    if query.occurrences != 2 or body.occurrences != 1:
+        raise AssertionError((query.occurrences, body.occurrences))
+    if query.method != "GET" or body.method != "POST":
+        raise AssertionError("method must be retained per finding")
+    if query.source != "crawl" or body.source != "form":
+        raise AssertionError("target source must be retained per finding")
+
+
+def test_finding_json_and_sarif_retain_target_attribution():
+    finding = Finding(
+        title="SQLi", severity=Severity.HIGH, plugin="Sql", parameter="name",
+        url="http://host/item", endpoint="http://host/item", method="POST",
+        parameter_location="body", source="form", target_id="shape-1",
+        source_url="http://host/page", generation=3,
+    )
+
+    data = json.loads(to_json([finding]))[0]
+    for key, value in (
+        ("endpoint", "http://host/item"),
+        ("method", "POST"),
+        ("parameter_location", "body"),
+        ("source", "form"),
+        ("source_url", "http://host/page"),
+        ("target_id", "shape-1"),
+        ("generation", 3),
+    ):
+        if data.get(key) != value:
+            raise AssertionError(f"{key} must be serialized as {value!r}")
+
+    properties = json.loads(to_sarif([finding]))["runs"][0]["results"][0][
+        "properties"
+    ]
+    if properties.get("method") != "POST":
+        raise AssertionError("SARIF must retain method")
+    if properties.get("parameterLocation") != "body":
+        raise AssertionError("SARIF must retain parameter location")
+    if properties.get("source") != "form":
+        raise AssertionError("SARIF must retain target source")
+    if properties.get("sourceUrl") != "http://host/page":
+        raise AssertionError("SARIF must retain target source URL")
+
+
 def test_json_serializes_enriched_fields():
     f = Finding(title="SQLi", severity=Severity.HIGH, plugin="Sql",
                 cwe="CWE-89", owasp="A03:2021-Injection", wstg="WSTG-INPV-05",

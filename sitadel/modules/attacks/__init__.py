@@ -2,6 +2,7 @@ import importlib
 import os
 import pkgutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from urllib.parse import parse_qsl, urlsplit
 
 from sitadel.config import settings
@@ -14,7 +15,17 @@ from sitadel.utils.events import (
     ProgressTotal,
 )
 from .. import IPlugin
-from .targets import Target, taint_body, taint_target, taint_url
+from .targets import (
+    Target,
+    TargetLedger,
+    TargetProbe,
+    merge_targets,
+    probe_target,
+    taint_body,
+    taint_target,
+    taint_url,
+    wire_shape,
+)
 
 
 def _publish(event) -> None:
@@ -33,7 +44,18 @@ def _cancelled() -> bool:
     except NameError:
         return False
 
-__all__ = ["AttackPlugin", "Attacks", "Target", "taint_body", "taint_target"]
+__all__ = [
+    "AttackPlugin",
+    "Attacks",
+    "Target",
+    "TargetLedger",
+    "TargetProbe",
+    "merge_targets",
+    "probe_target",
+    "taint_body",
+    "taint_target",
+    "taint_url",
+]
 
 
 class AttackPlugin(metaclass=IPlugin):
@@ -85,27 +107,84 @@ class AttackPlugin(metaclass=IPlugin):
     def build_targets(crawled_urls):
         """Assemble the injectable targets for this scan.
 
-        Every crawled URL becomes a GET query-string target (URLs without
-        parameters are skipped later by ``taint_target``), and any API targets
-        discovered by the discovery step (registered under ``api_targets``) are
-        appended so body injection reaches JSON/XML endpoints too.
+        Prefer the crawler's complete, versioned ``page_targets`` snapshot.
+        Falling back to the old URL-only reconstruction keeps direct callers
+        and third-party plugins working.  The result is de-duplicated by target
+        shape, so GET/query and POST/body on the same endpoint stay distinct
+        while duplicate probes do not.
         """
-        targets = [Target(url=url) for url in (crawled_urls or [])]
+        try:
+            page_targets = Services.get("page_targets")
+        except NameError:
+            page_targets = None
+
+        if page_targets:
+            targets = list(page_targets)
+            # A page snapshot is authoritative for its endpoints.  Do not
+            # resurrect an old GET/query target just because the URL also
+            # remains in ``crawled_urls`` after the page became POST/body.
+            endpoints = {target.endpoint for target in targets}
+            covered_shapes = {
+                (target.endpoint, wire_shape(target)) for target in targets
+            }
+            for url in (crawled_urls or []):
+                legacy = Target(
+                    url=url,
+                    method="GET",
+                    location="query",
+                    source="crawl",
+                )
+                if (
+                    legacy.endpoint in endpoints
+                    and (legacy.endpoint, wire_shape(legacy)) not in covered_shapes
+                ):
+                    continue
+                targets.append(legacy)
+                endpoints.add(legacy.endpoint)
+                covered_shapes.add((legacy.endpoint, wire_shape(legacy)))
+        else:
+            targets = [
+                Target(
+                    url=url,
+                    method="GET",
+                    location="query",
+                    source="crawl",
+                )
+                for url in (crawled_urls or [])
+            ]
+
         try:
             api_targets = Services.get("api_targets")
         except NameError:
             api_targets = None
         if api_targets:
             targets.extend(api_targets)
+
         # HTML forms discovered by the crawler (registered like api_targets), so
         # every injection module reaches POST/GET form parameters too (#70).
-        try:
-            form_targets = Services.get("form_targets")
-        except NameError:
-            form_targets = None
-        if form_targets:
-            targets.extend(form_targets)
-        return targets
+        # When ``page_targets`` exists it already contains the current form
+        # snapshot; appending the legacy service could resurrect a superseded
+        # shape from an earlier crawl attempt.
+        if not page_targets:
+            try:
+                form_targets = Services.get("form_targets")
+            except NameError:
+                form_targets = None
+            if form_targets:
+                targets.extend(form_targets)
+
+        targets = merge_targets(targets)
+        # Give legacy/flat targets a scan-local generation without changing
+        # already-versioned page/API targets.  Deterministic across repeated
+        # build_targets() calls (progress accounting, module runs, report).
+        default_generation = max(
+            (target.generation for target in targets), default=0
+        ) or 1
+        return [
+            target if target.generation
+            else replace(target, generation=default_generation)
+            for target in targets
+        ]
 
     def run_injection(self, payloads, crawled_urls, detector, workers=20):
         """Test ``payloads`` against every injectable target with one pool.
@@ -120,43 +199,60 @@ class AttackPlugin(metaclass=IPlugin):
         logger = Services.get("logger")
         request = Services.get("request_factory")
         targets = self.build_targets(crawled_urls)
-        # Announce each endpoint under test once (not per payload) so the crawl
-        # tree can mark it without flooding the event bus.
+        # Announce each endpoint shape under test once (not per payload) so the
+        # crawl tree can mark it without flooding the event bus.
         announced: set = set()
 
         def probe(payload, target):
             try:
                 if _cancelled():
                     return
-                kwargs = taint_target(target, payload)
-                if kwargs is None:
+                # One immutable snapshot supplies both the wire request and the
+                # finding attribution.  Never re-derive parameter names from a
+                # different target shape after the request has been sent.
+                current = probe_target(target, payload)
+                if current is None:
                     return
-                if target.url not in announced:
-                    announced.add(target.url)
+                announce_key = (
+                    current.endpoint,
+                    current.method,
+                    current.location,
+                    current.target_id,
+                )
+                if announce_key not in announced:
+                    announced.add(announce_key)
                     _publish(PageTesting(target.url))
                     # One progress unit per (module, target) as it is reached.
                     _publish(ProgressStep(1))
                 output.debug("Testing: %s" % target.describe())
-                resp = request.send(**kwargs)
+                resp = request.send(**current.request_kwargs)
                 if resp is None:
                     return
                 label = detector(resp, payload)
                 if label:
-                    # Record which field carried the payload so the report (and
-                    # its de-duplication) can tell apart issues on one endpoint:
-                    # the body fields for a JSON/XML/form target, else the query
-                    # parameters taint_url rewrote.
-                    if target.body_format:
-                        parameter = ",".join(target.params) or None
-                    else:
-                        parameter = self.tainted_params(target.url)
                     output.finding(
                         "That site may be vulnerable to %s at %s\nInjection: %s"
                         % (label, target.describe(), payload),
-                        url=kwargs["url"],
+                        url=current.url,
                         plugin=type(self).__name__,
-                        parameter=parameter,
-                        evidence="payload=%s | matched=%s" % (payload, label),
+                        parameter=current.parameter,
+                        endpoint=current.endpoint,
+                        method=current.method,
+                        parameter_location=current.location,
+                        source=current.source,
+                        source_url=current.source_url,
+                        target_id=current.target_id,
+                        generation=current.generation,
+                        evidence=(
+                            "payload=%s | matched=%s | target=%s %s %s"
+                            % (
+                                payload,
+                                label,
+                                current.method,
+                                current.location,
+                                current.target_id,
+                            )
+                        ),
                     )
             except Exception as err:
                 logger.error(err)
