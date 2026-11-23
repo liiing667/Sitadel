@@ -7,6 +7,7 @@
 # @license: See the file 'LICENSE.txt'
 
 import argparse
+import os
 import sys
 import signal
 import threading
@@ -191,18 +192,32 @@ class Sitadel(object):
             Services.register("events", bus)
             Services.register("cancel", cancel)
             target = str(validator.validate_target(args.url))
+            scan_generation = {"value": None}
 
             def reporter(fmt: str):
                 """Write the collected findings in ``fmt``; return (path, n)."""
-                findings = Services.get("findings").all()
+                generation = scan_generation["value"]
+                # A scan that failed before installing its generation has no
+                # findings of its own; never fall back to a prior run's.
+                findings = []
+                if generation is not None:
+                    findings = generation.report_findings()
                 path = args.output or f"sitadel-report.{fmt}"
                 write_report(findings, fmt, path)
+                if generation is not None:
+                    generation.record_report(fmt, path)
                 return path, len(findings)
+
+            def scan():
+                try:
+                    self._execute(args, quiet=True)
+                finally:
+                    scan_generation["value"] = self.generation
 
             # Auto-prompt for a format at the end only when one wasn't already
             # requested on the command line (that path writes the report itself).
             run_tui(
-                lambda: self._execute(args, quiet=True), bus, target, cancel,
+                scan, bus, target, cancel,
                 reporter=reporter,
                 auto_export=(args.report_format == "stdout"),
             )
@@ -226,6 +241,22 @@ class Sitadel(object):
         bus.publish(RiskLevel(risk.value, risk.name))
 
     def _execute(self, args, quiet: bool = False):
+        # Reset per-scan handles first: a failure before begin_generation must
+        # not leave a previous scan's generation looking current.
+        self.generation = None
+        self.scan_generation = None
+        # The report path belongs to this run.  Drop a previous run's file
+        # before any validation/config work, so a failure at any point cannot
+        # leave an old report that looks like the current scan's output.
+        if getattr(args, "report_format", "stdout") != "stdout":
+            stale_report = (
+                getattr(args, "output", None)
+                or f"sitadel-report.{args.report_format}"
+            )
+            try:
+                os.unlink(stale_report)
+            except OSError:
+                pass
         # Verify the target URL
         self.url = validator.validate_target(args.url)
 
@@ -249,12 +280,27 @@ class Sitadel(object):
         if args.scope_hosts:
             scope_hosts.extend(args.scope_hosts)
 
+        # Start a new scan generation *before* registering the output channel
+        # and the mutable scan services.  Everything below (fingerprint
+        # profile, crawl snapshot, attack findings, report) is then owned by
+        # this generation; a retry starts a clean one instead of inheriting the
+        # previous run's pages or findings.
+        findings = Findings()
+        profile = TargetProfile()
+        generation = Services.begin_generation(
+            target=str(self.url),
+            label=getattr(args, "url", None),
+            findings=findings,
+            profile=profile,
+        )
+        self.generation = generation
+        self.scan_generation = generation
+
         # Register services
         Services.register("datastore", Datastore(settings.datastore))
         Services.register("logger", logger)
         Services.register("output", Output(args.verbosity, quiet=quiet))
-        Services.register("findings", Findings())
-        Services.register("profile", TargetProfile())
+        Services.register("api_targets", [])
         Services.register(
             "request_factory",
             SingleRequest(
@@ -270,37 +316,48 @@ class Sitadel(object):
             ),
         )
 
-        # Configure authentication (if any) and log in before scanning so all
-        # phases run as an authenticated user.
-        authenticator = Authenticator.from_options(
-            basic=args.auth_basic,
-            bearer=args.auth_bearer,
-            headers=args.headers,
-            login_url=args.login_url,
-            login_data=args.login_data,
-            csrf_field=args.csrf_field,
-            logged_in_check=args.logged_in_check,
-        )
-        if authenticator is not None:
-            request_factory = Services.get("request_factory")
-            request_factory.set_authenticator(authenticator)
-            if authenticator.has_login:
-                request_factory.login()
-                probe = request_factory.send(url=self.url, method="GET")
-                if authenticator.looks_logged_out(probe):
-                    Services.get("output").error(
-                        "Login may have failed: the 'logged-in' check did not "
-                        "match after authenticating."
-                    )
-                else:
-                    Services.get("output").info("Authenticated to the target.")
-
-        # Display target and scan starting time (the TUI renders its own header).
-        if not quiet:
-            self.bn.preamble(self.url)
+        status = "complete"
+        failure = None
         try:
+            # Configure authentication (if any) and log in before scanning so
+            # all phases run as an authenticated user.
+            authenticator = Authenticator.from_options(
+                basic=args.auth_basic,
+                bearer=args.auth_bearer,
+                headers=args.headers,
+                login_url=args.login_url,
+                login_data=args.login_data,
+                csrf_field=args.csrf_field,
+                logged_in_check=args.logged_in_check,
+            )
+            if authenticator is not None:
+                request_factory = Services.get("request_factory")
+                request_factory.set_authenticator(authenticator)
+                if authenticator.has_login:
+                    request_factory.login()
+                    probe = request_factory.send(url=self.url, method="GET")
+                    if authenticator.looks_logged_out(probe):
+                        Services.get("output").error(
+                            "Login may have failed: the 'logged-in' check did "
+                            "not match after authenticating."
+                        )
+                    else:
+                        Services.get("output").info(
+                            "Authenticated to the target."
+                        )
+
+            # Display target and scan starting time (the TUI renders its own
+            # header).
+            if not quiet:
+                self.bn.preamble(self.url)
+
             # Run the fingerprint modules
             self._phase("fingerprint")
+            if (
+                Services.current_generation() is not generation
+                or not generation.active
+            ):
+                return
             self.ma.fingerprints(
                 args.fingerprint,
                 self.url,
@@ -308,6 +365,11 @@ class Sitadel(object):
             )
 
             # Show the assembled target profile that will drive attack selection
+            if (
+                Services.current_generation() is not generation
+                or not generation.active
+            ):
+                return
             profile = Services.get("profile")
             if profile.technologies:
                 Services.get("output").info(f"Target profile: {profile.summary()}")
@@ -315,6 +377,13 @@ class Sitadel(object):
             # Run the crawler to discover urls
             self._phase("crawl")
             discovered_urls = self.ma.crawler(self.url, args.user_agent)
+            if (
+                Services.current_generation() is not generation
+                or not generation.active
+            ):
+                # A retry superseded this scan while its crawl was in flight.
+                # Never let the old surface feed the new scan's attack phase.
+                return
 
             # Record the crawl surface. The count goes to console + file; the
             # full list is file-only (-v) so the log lets you review every path
@@ -351,22 +420,44 @@ class Sitadel(object):
                 signal.signal(signal.SIGINT, signal.default_int_handler)
 
             # Run the attack modules on discovered urls
+            if (
+                Services.current_generation() is not generation
+                or not generation.active
+            ):
+                return
             self._phase("attack")
             self.ma.attacks(args.attack, self.url, discovered_urls)
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
+            status = "cancelled"
+            failure = exc
+            raise
+        except BaseException as exc:
+            status = "failed"
+            failure = exc
             raise
         finally:
             # Write the findings report (console findings are printed live by
-            # Output.finding regardless of the chosen format).
-            if args.report_format != "stdout":
-                findings = Services.get("findings").all()
-                path = args.output or f"sitadel-report.{args.report_format}"
-                write_report(findings, args.report_format, path)
-                Services.get("output").info(
-                    f"Wrote {len(findings)} finding(s) to {path}"
-                )
-            if not quiet:
-                self.bn.postscript()
+            # Output.finding regardless of the chosen format).  The report is
+            # built from this generation's collector only, so a partially
+            # failed scan can never append another run's findings.
+            try:
+                if (
+                    args.report_format != "stdout"
+                    and Services.current_generation() is generation
+                ):
+                    path = args.output or f"sitadel-report.{args.report_format}"
+                    findings = generation.report_findings()
+                    write_report(findings, args.report_format, path)
+                    generation.record_report(args.report_format, path)
+                    Services.get("output").info(
+                        f"Wrote {len(findings)} finding(s) to {path}"
+                    )
+            finally:
+                # Close the generation even if serialising the report failed;
+                # any still-running worker for it can no longer add findings.
+                Services.end_generation(generation, status, failure)
+                if not quiet:
+                    self.bn.postscript()
 
 
 def main():

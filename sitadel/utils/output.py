@@ -18,17 +18,36 @@ class Output:
     c = Fore.CYAN
     e = Style.RESET_ALL
 
-    def __init__(self, level: int = 0, quiet: bool = False):
+    def __init__(self, level: int = 0, quiet: bool = False, generation=None):
         # ``level`` is the -v count; it gates how much reaches the console.
         self.level = level
         # ``quiet`` suppresses stdout (used by the TUI front-end, which owns the
         # screen and renders findings/logs itself from the event bus). The file
         # logger and the event bus are unaffected, so nothing is lost.
         self.quiet = quiet
+        # Bind the output channel to the scan generation that created it.  A
+        # worker that outlives its scan keeps pointing at the old generation,
+        # so a late finding can never be recorded in the next scan's report.
+        # ``None`` preserves the legacy behaviour for direct Output() users.
+        self._explicit_generation = generation is not None
+        if generation is None:
+            generation = Services.current_generation()
+            # A closed generation is history: a newly constructed channel is
+            # a legacy/direct caller, not a late writer for that old scan.  The
+            # per-finding path below keeps a legacy collector registered by
+            # such a caller working without ever feeding the closed report.
+            if generation is not None and not generation.active:
+                generation = None
+        self.generation = generation
         # File logging is owned by the ``sitadelLog`` logger. Every console
         # message is mirrored there, and ``trace`` adds file-only detail, so
         # the log file is always a superset of stdout.
         self.logger = logging.getLogger("sitadelLog")
+
+    def bind_generation(self, generation) -> None:
+        """Move this channel to ``generation`` (used when reusing an Output)."""
+        self.generation = generation
+        self._explicit_generation = False
 
     @staticmethod
     def _bus():
@@ -53,6 +72,25 @@ class Output:
         ``plugin`` name), so even single-string findings gain a sane severity,
         confidence, and CWE/OWASP/WSTG mapping. Explicit arguments always win.
         """
+        current = Services.current_generation()
+        generation = self.generation
+        if generation is None:
+            if current is not None and current.active:
+                # Bind an Output created before the scan started on first use.
+                generation = current
+                self.generation = current
+        elif generation is not current or not generation.active:
+            # A generation-scoped output is frozen once its scan is over.  A
+            # direct caller can move the channel with ``bind_generation`` (or
+            # by re-registering it through ``Services``), but a late worker
+            # must never silently adopt a newer scan and pollute its report.
+            self.logger.debug(
+                "Dropping finding from inactive scan generation %s: %s",
+                getattr(generation, "id", generation),
+                value,
+            )
+            return
+
         if not self.quiet:
             print(f"{self.g}[+]{self.e} {self.w}{value}{self.e}", flush=True)
         self.logger.info("FINDING: %s", value)
@@ -78,13 +116,29 @@ class Output:
             remediation=pick(remediation, "remediation"),
         )
 
-        # Record for report generation, when a collector is registered.
-        try:
-            collector = Services.get("findings")
-        except NameError:
-            collector = None
-        if collector is not None:
-            collector.add(finding)
+        # Record for report generation, when a collector is registered.  A
+        # generation-owned Output writes to that generation's collector even if
+        # a retry has already replaced the service slot.
+        if generation is not None:
+            if not generation.add_finding(finding):
+                return
+        else:
+            try:
+                collector = Services.get("findings")
+            except NameError:
+                collector = None
+            # After a scan has closed, a fresh Output() is a legacy caller.
+            # It must not append to the closed scan's collector merely because
+            # that collector is still the last value in the service slot.
+            if (
+                collector is not None
+                and current is not None
+                and not current.active
+                and collector is current.findings
+            ):
+                collector = None
+            if collector is not None:
+                collector.add(finding)
 
         # Publish to the live UI (TUI). No-op in plain CLI mode.
         bus = self._bus()

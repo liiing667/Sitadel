@@ -12,6 +12,16 @@ class FingerprintPlugin(metaclass=IPlugin):
     # Default risk level for fingerprint module is NO DANGER since it only analyze one request response
     level = Risk.NO_DANGER
 
+    def __init__(self):
+        # Snapshot the services this plugin instance was created with; see the
+        # equivalent guard in ``AttackPlugin``.
+        for attr in ("output", "request", "datastore", "logger"):
+            if hasattr(type(self), attr):
+                try:
+                    setattr(self, attr, getattr(type(self), attr))
+                except Exception:
+                    pass
+
     @classmethod
     def enabled(cls):
         """Registered plugins whose risk level is within the configured risk.
@@ -41,8 +51,29 @@ class Fingerprints:
         self.output = Services.get("output")
         self.logger = Services.get("logger")
         self.request = Services.get("request_factory")
+        # Bind the profile to the generation that owns this fingerprint pass.
+        self.generation = Services.current_generation()
+        if self.generation is not None and not self.generation.active:
+            self.generation = None
+
+    def _generation_is_current(self):
+        return (
+            self.generation is None
+            or (
+                self.generation is Services.current_generation()
+                and self.generation.active
+            )
+        )
 
     def run(self, plugins_activated):
+        if self.generation is None:
+            current = Services.current_generation()
+            if current is not None and current.active:
+                # Fingerprinter created just before the scan installed its
+                # generation.
+                self.generation = current
+        if not self._generation_is_current():
+            return
         self.output.info("Launching fingerprints modules...")
         # Register the plugins from configuration
         for p in plugins_activated:
@@ -82,8 +113,13 @@ class Fingerprints:
 
             # Aggregate detections into the shared TargetProfile (if registered)
             # so the attack phase can decide which classes are worth launching.
+            if not self._generation_is_current():
+                return
             try:
-                profile = Services.get("profile")
+                if self.generation is not None:
+                    profile = self.generation.profile
+                else:
+                    profile = Services.get("profile")
             except NameError:
                 profile = None
 

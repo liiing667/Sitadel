@@ -44,6 +44,19 @@ class AttackPlugin(metaclass=IPlugin):
     # attack applies to any target.
     requires: dict = {}
 
+    def __init__(self):
+        # Snapshot the services this plugin instance was created with.  Class
+        # attributes are refreshed when a new scan registers its services, but
+        # an already-running instance must keep its own channel so a late
+        # finding from the previous generation is dropped, not written into the
+        # retry's report.
+        for attr in ("output", "request", "datastore", "logger"):
+            if hasattr(type(self), attr):
+                try:
+                    setattr(self, attr, getattr(type(self), attr))
+                except Exception:
+                    pass
+
     def applies_to(self, profile):
         """Whether this attack is relevant given the fingerprint profile.
 
@@ -204,8 +217,38 @@ class Attacks:
         self.logger = Services.get("logger")
         self.start_url = start_url
         self.crawled_urls = crawled_urls
+        # Freeze the scan this runner belongs to.  The crawl snapshot is the
+        # authoritative page list for that generation; an explicit list passed
+        # by an old caller is still honoured (including the empty list).
+        self.generation = Services.current_generation()
+        if self.generation is not None and not self.generation.active:
+            self.generation = None
+
+    def _crawled_urls(self):
+        """URLs to attack, preferring this generation's completed snapshot."""
+        if self.crawled_urls is None and self.generation is not None:
+            snapshot = self.generation.crawl
+            if snapshot is not None:
+                return list(snapshot.urls)
+        return self.crawled_urls
+
+    def _generation_is_current(self):
+        return (
+            self.generation is None
+            or (
+                self.generation is Services.current_generation()
+                and self.generation.active
+            )
+        )
 
     def run(self, plugins_activated):
+        if self.generation is None:
+            current = Services.current_generation()
+            if current is not None and current.active:
+                # Runner created just before the scan installed its generation.
+                self.generation = current
+        if not self._generation_is_current():
+            return
         self.output.info("Launching attacks modules...")
         # Register the plugins from configuration
         for p in plugins_activated:
@@ -220,9 +263,18 @@ class Attacks:
         # Consult the fingerprint profile (if any) to skip attack classes that
         # do not apply to the detected stack.
         try:
-            profile = Services.get("profile")
+            if self.generation is not None:
+                # A superseded generation must not feed its profile/findings
+                # into the scan that replaced it.
+                if not self._generation_is_current():
+                    return
+                profile = self.generation.profile
+            else:
+                profile = Services.get("profile")
         except NameError:
             profile = None
+
+        crawled_urls = self._crawled_urls()
 
         try:
             selected = []
@@ -241,13 +293,13 @@ class Attacks:
             # advance it per target (ProgressStep above); every module also
             # snaps to its full share when it finishes, so modules that do not
             # iterate targets still move the bar.
-            unit = max(len(AttackPlugin.build_targets(self.crawled_urls)), 1)
+            unit = max(len(AttackPlugin.build_targets(crawled_urls)), 1)
             _publish(ProgressTotal(len(selected) * unit))
             attacks = []
             for i, instance in enumerate(selected):
                 if _cancelled():
                     break
-                result = instance.process(self.start_url, self.crawled_urls)
+                result = instance.process(self.start_url, crawled_urls)
                 attacks.append((instance, result))
                 _publish(ProgressSnap((i + 1) * unit))
             for category, result in attacks:

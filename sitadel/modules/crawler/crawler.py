@@ -11,6 +11,7 @@ from sitadel.config import settings
 from sitadel.modules.attacks.targets import Target
 from sitadel.utils.container import Services
 from sitadel.utils.events import PageDiscovered
+from sitadel.utils.generation import CrawlSnapshot
 
 
 def _publish(event) -> None:
@@ -292,20 +293,51 @@ async def _crawl(start_url: str, user_agent: str, cfg: dict) -> list[str]:
 
 def crawl(url, user_agent):
     output = Services.get("output")
+    generation = Services.current_generation()
+    if generation is not None and not generation.active:
+        # A closed generation is history.  Treat this as a legacy/direct crawl
+        # rather than binding its pages to a scan that can no longer report.
+        generation = None
+    if generation is not None and generation.active:
+        # A crawl defines the page surface for the rest of the scan.  Clear the
+        # previous surface *before* fetching, so a timeout or exception below
+        # leaves the current generation with no pages rather than the previous
+        # generation's pages.  The completed snapshot is installed atomically
+        # when the crawl returns.
+        generation.clear_crawl()
+    elif generation is None:
+        # Legacy direct crawls get the same page-surface reset.  The public
+        # return value and the rest of the old service contract are unchanged,
+        # but a retried crawl cannot expose the previous run's page cache.
+        for key in ("form_targets", "page_bodies", "crawl_snapshot"):
+            Services.services.pop(key, None)
     output.info("Start crawling the target website")
     urls, form_targets, page_bodies = asyncio.run(
         _crawl(str(url), user_agent, _config())
     )
-    # Expose the fetched page bodies for the passive secret scanner (registered
-    # as a side effect like ``form_targets``, so re-fetching is unnecessary).
-    if page_bodies:
-        Services.register("page_bodies", page_bodies)
-    # Register discovered forms as injectable targets, mirroring how API
-    # discovery registers ``api_targets``; ``build_targets`` extends with them.
-    # The public return stays ``list[str]`` so existing callers are unaffected.
-    if form_targets:
-        Services.register("form_targets", form_targets)
-        output.info(
-            "Crawler discovered %d HTML form target(s)" % len(form_targets)
+    if generation is not None:
+        # Only publish the snapshot if this crawl still belongs to the current
+        # generation.  A retry that started while the old crawl was finishing
+        # must not graft its pages onto the new scan.
+        if Services.current_generation() is generation and generation.active:
+            generation.snapshot_crawl(urls, form_targets, page_bodies)
+            if form_targets:
+                output.info(
+                    "Crawler discovered %d HTML form target(s)"
+                    % len(form_targets)
+                )
+    else:
+        # Legacy mode: no generation was installed, so keep the historical
+        # side effects, writing empty containers when this crawl found nothing
+        # so a previous crawl's pages cannot linger.
+        Services.register("page_bodies", dict(page_bodies))
+        Services.register("form_targets", list(form_targets))
+        Services.register(
+            "crawl_snapshot",
+            CrawlSnapshot.capture(0, urls, form_targets, page_bodies),
         )
+        if form_targets:
+            output.info(
+                "Crawler discovered %d HTML form target(s)" % len(form_targets)
+            )
     return urls
