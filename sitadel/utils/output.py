@@ -6,6 +6,7 @@ from colorama import Fore, Style
 
 from sitadel.report import Finding, Severity
 from sitadel.report.knowledge import lookup as _lookup_knowledge
+from sitadel.utils.redaction import redact_finding
 from sitadel.utils.container import Services
 from sitadel.utils.events import FindingAdded, Log
 
@@ -77,6 +78,11 @@ class Output:
             wstg=pick(wstg, "wstg"),
             remediation=pick(remediation, "remediation"),
         )
+        # Shared redaction gate before the finding reaches the collector, the
+        # TUI event stream or any report consumer: a credential embedded in a
+        # title, URL (including query strings) or evidence is masked once here
+        # and stays masked through every later serialization/encoding.
+        redact_finding(finding)
 
         # Record for report generation, when a collector is registered.
         try:

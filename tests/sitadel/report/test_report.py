@@ -137,3 +137,91 @@ def test_html_shows_evidence_remediation_and_count():
     for needle in ("MySQL syntax error", "Use prepared statements", "CWE-89", "7"):
         if needle not in out:
             raise AssertionError(f"HTML must show {needle!r}")
+
+
+SECRET = "AKIAIOSFODNN7EXAMPLE"
+GCP = "AIzaSyA1234567890123456789012345678901234"
+
+
+def _secret_finding():
+    return Finding(
+        title="Secret leaked at https://h/cb?token=%s" % GCP,
+        severity=Severity.HIGH,
+        url="https://h/cb?token=%s&id=1" % GCP,
+        evidence="matched AWS access key id: %s" % SECRET,
+        plugin="Secrets",
+        parameter="AWS access key id",
+        other_urls=["https://h/x?api_key=%s" % SECRET],
+    )
+
+
+def test_every_format_is_redacted_through_the_shared_pass():
+    finding = _secret_finding()
+    for rendered in (to_json([finding]), to_sarif([finding]), to_html([finding])):
+        if SECRET in rendered or GCP in rendered:
+            raise AssertionError("a report format still contains the raw secret")
+
+
+def test_serializers_do_not_mutate_the_callers_findings():
+    finding = _secret_finding()
+    original_evidence = finding.evidence
+    to_json([finding])
+    to_sarif([finding])
+    to_html([finding])
+    if finding.evidence != original_evidence:
+        raise AssertionError("redaction must work on detached copies")
+    if SECRET not in finding.evidence:
+        raise AssertionError("the caller's in-memory finding must stay intact")
+
+
+def test_html_escaping_cannot_recover_the_secret():
+    import html as _html
+    rendered = to_html([_secret_finding()])
+    if SECRET in _html.unescape(rendered):
+        raise AssertionError("unescaping the HTML must not restore the secret")
+
+
+def test_write_failure_leaves_no_artifact_with_raw_secret(tmp_path):
+    # Point the report at a path whose parent directory does not exist: the
+    # atomic write must fail and no temp file carrying the (redacted) payload
+    # may be left behind anywhere.
+    bad_path = os.path.join(str(tmp_path), "missing-dir", "report.json")
+    raised = False
+    try:
+        write_report([_secret_finding()], "json", bad_path)
+    except OSError:
+        raised = True
+    if not raised:
+        raise AssertionError("the write was expected to fail")
+    leftovers = [
+        n for n in os.listdir(str(tmp_path))
+        if n.startswith(".sitadel-report-")
+    ]
+    if leftovers:
+        raise AssertionError("failed write must not leave temp files behind")
+
+
+def test_retry_and_second_format_never_recover_value(tmp_path):
+    finding = _secret_finding()
+    json_path = os.path.join(str(tmp_path), "r.json")
+    html_path = os.path.join(str(tmp_path), "r.html")
+    sarif_path = os.path.join(str(tmp_path), "r.sarif")
+    # Simulate a retry: write the same findings twice to the same path.
+    write_report([finding], "json", json_path)
+    write_report([finding], "json", json_path)
+    write_report([finding], "html", html_path)
+    write_report([finding], "sarif", sarif_path)
+    for path in (json_path, html_path, sarif_path):
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+        if SECRET in content or GCP in content:
+            raise AssertionError("retry/second format exposed the secret")
+
+
+def test_empty_findings_still_render_in_every_format():
+    if json.loads(to_json([])) != []:
+        raise AssertionError
+    if '"results": []' not in to_sarif([]):
+        raise AssertionError
+    if "No findings" not in to_html([]):
+        raise AssertionError

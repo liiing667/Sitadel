@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import html as _html
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from urllib.parse import urlsplit, urlunsplit
+
+from sitadel.utils.redaction import redact_findings
 
 
 class Severity(str, Enum):
@@ -111,7 +115,10 @@ def _to_dict(finding: Finding) -> dict:
 
 
 def to_json(findings: list[Finding]) -> str:
-    return json.dumps([_to_dict(f) for f in findings], indent=2)
+    # Shared redaction pass before serialization: the raw credential never
+    # reaches the text buffer, so JSON "\u" escaping cannot restore it.
+    safe = redact_findings([_clone(f) for f in findings])
+    return json.dumps([_to_dict(f) for f in safe], indent=2)
 
 
 # SARIF level per severity (SARIF only knows note/warning/error).
@@ -125,9 +132,10 @@ _SARIF_LEVEL = {
 
 
 def to_sarif(findings: list[Finding]) -> str:
+    safe = redact_findings([_clone(f) for f in findings])
     results = []
     rules: dict[str, dict] = {}
-    for f in findings:
+    for f in safe:
         severity = f.severity if isinstance(f.severity, Severity) else Severity.INFO
         rule_id = f.plugin or f.title
 
@@ -190,8 +198,11 @@ def _std_cell(finding: Finding) -> str:
 
 
 def to_html(findings: list[Finding]) -> str:
+    # Redact first, then HTML-escape: escaping only encodes already-masked
+    # text, so entity encoding can never bring the secret back.
+    safe = redact_findings([_clone(f) for f in findings])
     rows = []
-    for f in findings:
+    for f in safe:
         severity = f.severity.value if isinstance(f.severity, Severity) else f.severity
         occ = str(f.occurrences) if f.occurrences and f.occurrences > 1 else ""
         cells = [
@@ -223,7 +234,7 @@ def to_html(findings: list[Finding]) -> str:
         ".sev-medium td:first-child{background:#fbca04}"
         ".sev-low td:first-child{background:#c2e0c6}"
         "</style></head><body>"
-        f"<h1>Sitadel report</h1><p>{len(findings)} finding(s)</p>"
+        f"<h1>Sitadel report</h1><p>{len(safe)} finding(s)</p>"
         "<table><thead><tr><th>Severity</th><th>Confidence</th><th>Title</th>"
         "<th>URL</th><th>Parameter</th><th>Count</th><th>Evidence</th>"
         "<th>CWE / OWASP / WSTG</th><th>Remediation</th></tr></thead>"
@@ -234,9 +245,57 @@ def to_html(findings: list[Finding]) -> str:
 
 _SERIALIZERS = {"json": to_json, "sarif": to_sarif, "html": to_html}
 
+# Note on secret handling: every serializer starts by running the shared
+# redaction pass (:func:`sitadel.utils.redaction.redact_findings`) on detached
+# copies of the findings. Raw credentials are therefore destroyed before any
+# JSON ``\\u`` escaping or HTML entity encoding happens, and before the bytes
+# reach a file, so retries, encoding round-trips or a second output format can
+# never recover the original value.
+
+
+def _clone(finding: Finding) -> Finding:
+    """Detached copy so redaction never mutates the caller's findings."""
+    return Finding(
+        title=finding.title,
+        severity=finding.severity,
+        url=finding.url,
+        parameter=finding.parameter,
+        evidence=finding.evidence,
+        confidence=finding.confidence,
+        plugin=finding.plugin,
+        cwe=finding.cwe,
+        owasp=finding.owasp,
+        wstg=finding.wstg,
+        remediation=finding.remediation,
+        occurrences=finding.occurrences,
+        other_urls=list(finding.other_urls),
+    )
+
 
 def write_report(findings: list[Finding], fmt: str, path: str) -> None:
-    """Serialize ``findings`` in ``fmt`` and write to ``path``."""
+    """Serialize ``findings`` in ``fmt`` and write to ``path`` atomically.
+
+    The serialized text is built entirely from the redacted finding copies
+    used by the serializers, then written to a temporary file in the same
+    directory and renamed into place. A write failure (disk full, permission
+    error, interruption, retry) leaves only the temp file — containing masked
+    text — which is cleaned up, so no partial artifact can expose or recover
+    a raw credential.
+    """
     serializer = _SERIALIZERS[fmt]
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(serializer(findings))
+    payload = serializer(findings)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".sitadel-report-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup; never leave the temp file behind on failure.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise

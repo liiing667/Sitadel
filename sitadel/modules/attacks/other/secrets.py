@@ -6,41 +6,25 @@ keys). Reads the page bodies the crawler already fetched (registered under the
 (e.g. a direct call), it falls back to fetching the start URL and crawled URLs.
 
 Passive and low-risk (``Risk.NO_DANGER``): it only reads content already served.
-Matched secrets are redacted in the evidence so the report never stores the raw
-credential.
+All raw credentials are destroyed in one redaction pass shared with the report
+consumers: the re-published ``page_bodies`` snapshot, each matched span in the
+evidence, and the finding URL (including query-string tokens) are all masked
+via :mod:`sitadel.utils.redaction`, so no artifact — JSON, SARIF or HTML — can
+ever store or re-encode the original value.
 """
-import re
 
 from sitadel.config.settings import Risk
+from sitadel.utils.redaction import (
+    SECRET_PATTERNS,
+    mask_secret,
+    redact_text,
+    redact_url,
+)
 from sitadel.utils.container import Services
 from .. import AttackPlugin
 
-# (label, pattern, firm?) — firm matches are high-precision; the rest are
-# marked tentative because they can legitimately appear in page content.
-_SECRETS = [
-    ("AWS access key id", re.compile(r"AKIA[0-9A-Z]{16}"), True),
-    ("Google API key", re.compile(r"AIza[0-9A-Za-z_\-]{35}"), True),
-    ("Slack token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,48}"), True),
-    ("Slack webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+"), True),
-    ("Stripe live secret key", re.compile(r"sk_live_[0-9A-Za-z]{24,}"), True),
-    ("GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"), True),
-    ("Google OAuth client secret", re.compile(r"GOCSPX-[0-9A-Za-z_\-]{20,}"), True),
-    ("Private key block", re.compile(
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"), True),
-    ("JSON Web Token", re.compile(
-        r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), False),
-    ("Hardcoded secret assignment", re.compile(
-        r"""(?i)(?:api[_-]?key|secret|token|passwd|password)"""
-        r"""\s*[:=]\s*['"][A-Za-z0-9_\-]{16,}['"]"""), False),
-]
-
-
-def _redact(match: str) -> str:
-    """Show only the first/last few characters so the report leaks nothing."""
-    match = match.strip()
-    if len(match) <= 12:
-        return match[:2] + "***"
-    return "%s...%s" % (match[:6], match[-4:])
+# Detection reuses the canonical patterns so masking and detection never drift.
+_SECRETS = SECRET_PATTERNS
 
 
 class Secrets(AttackPlugin):
@@ -69,11 +53,15 @@ class Secrets(AttackPlugin):
             m = pattern.search(body)
             if not m:
                 continue
+            # The matched span is masked with the shared redactor before it
+            # reaches any artifact: evidence string, finding URL or snapshot.
+            safe_span = mask_secret(m.group(0))
+            safe_url = redact_url(str(url))
             output.finding(
-                "Secret leaked in response (%s) at %s" % (label, url),
-                url=url, plugin="Secrets", parameter=label,
+                "Secret leaked in response (%s) at %s" % (label, safe_url),
+                url=safe_url, plugin="Secrets", parameter=label,
                 confidence="firm" if firm else "tentative",
-                evidence="matched %s: %s" % (label, _redact(m.group(0))),
+                evidence="matched %s: %s" % (label, safe_span),
                 finding_type="secret_leak",
             )
 
@@ -87,6 +75,13 @@ class Secrets(AttackPlugin):
         except Exception as e:
             logger.error(e)
             return
+        # Single redaction publication point. Scan the raw bodies first (so
+        # pattern matching is unaffected), then replace the shared cache with
+        # snapshots in which every secret is already masked. Every later
+        # consumer — findings, logs, JSON/SARIF/HTML reports — therefore reads
+        # only redacted text and no write retry or second format can recover
+        # the raw credential.
+        redacted_bodies = {}
         for url, body in bodies.items():
             if self._cancelled():
                 break
@@ -95,6 +90,17 @@ class Secrets(AttackPlugin):
             except Exception as e:
                 logger.error(e)
                 output.debug("Secret-scan error on %s: %s" % (url, e))
+            # Both the URL key (a token can ride the query string) and the
+            # page text are replaced by redacted snapshots. The only consumer
+            # of this cache is this scanner itself, which has finished
+            # scanning by the time the snapshot is re-published.
+            try:
+                redacted_bodies[redact_url(str(url))] = redact_text(body)
+            except Exception as e:
+                logger.error(e)
+        # Always re-publish, even when empty: an empty redacted snapshot must
+        # replace (never leave behind) a raw cache, including on early cancel.
+        Services.register("page_bodies", redacted_bodies)
 
     @staticmethod
     def _cancelled():
