@@ -1,9 +1,11 @@
 import importlib
 import os
 import pkgutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl, urlsplit
 
+from .. import IPlugin
+from .batch import Batch, BatchClosed, is_cancelled as _batch_cancelled
+from .targets import Target, taint_body, taint_target, taint_url
 from sitadel.config import settings
 from sitadel.config.settings import Risk
 from sitadel.utils.container import Services
@@ -13,8 +15,6 @@ from sitadel.utils.events import (
     ProgressStep,
     ProgressTotal,
 )
-from .. import IPlugin
-from .targets import Target, taint_body, taint_target, taint_url
 
 
 def _publish(event) -> None:
@@ -28,10 +28,7 @@ def _publish(event) -> None:
 
 def _cancelled() -> bool:
     """Whether the user asked to stop the scan (TUI quit); else False."""
-    try:
-        return Services.get("cancel").is_set()
-    except NameError:
-        return False
+    return _batch_cancelled()
 
 __all__ = ["AttackPlugin", "Attacks", "Target", "taint_body", "taint_target"]
 
@@ -115,6 +112,11 @@ class AttackPlugin(metaclass=IPlugin):
         value otherwise. The response signature is identical across GET query
         and JSON/XML/form body targets, so a module writes its detection once
         and it runs against every surface.
+
+        The whole run is one :class:`~sitadel.modules.attacks.batch.Batch`: the
+        request budget, worker futures, cancel signal and finding submission
+        share its state, so after a cancel or a request error every worker
+        converges and no finding can be written after the batch completed.
         """
         output = Services.get("output")
         logger = Services.get("logger")
@@ -123,61 +125,62 @@ class AttackPlugin(metaclass=IPlugin):
         # Announce each endpoint under test once (not per payload) so the crawl
         # tree can mark it without flooding the event bus.
         announced: set = set()
+        work = [(payload, target) for payload in payloads for target in targets]
 
-        def probe(payload, target):
-            try:
-                if _cancelled():
-                    return
-                kwargs = taint_target(target, payload)
-                if kwargs is None:
-                    return
-                if target.url not in announced:
-                    announced.add(target.url)
-                    _publish(PageTesting(target.url))
-                    # One progress unit per (module, target) as it is reached.
-                    _publish(ProgressStep(1))
-                output.debug("Testing: %s" % target.describe())
-                resp = request.send(**kwargs)
-                if resp is None:
-                    return
-                label = detector(resp, payload)
-                if label:
-                    # Record which field carried the payload so the report (and
-                    # its de-duplication) can tell apart issues on one endpoint:
-                    # the body fields for a JSON/XML/form target, else the query
-                    # parameters taint_url rewrote.
-                    if target.body_format:
-                        parameter = ",".join(target.params) or None
-                    else:
-                        parameter = self.tainted_params(target.url)
-                    output.finding(
-                        "That site may be vulnerable to %s at %s\nInjection: %s"
-                        % (label, target.describe(), payload),
-                        url=kwargs["url"],
-                        plugin=type(self).__name__,
-                        parameter=parameter,
-                        evidence="payload=%s | matched=%s" % (payload, label),
-                    )
-            except Exception as err:
-                logger.error(err)
-                output.debug("Injection error: %s" % err)
+        # One batch binds the request budget, futures, cancel signal and the
+        # Findings gate: once it ends, no queued probe (including ones parked
+        # on the rate limiter) can start or report.
+        with Batch(workers=workers,
+                   name=type(self).__name__) as batch:
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [
-                executor.submit(probe, payload, target)
-                for payload in payloads
-                for target in targets
-            ]
+            def probe(payload, target):
+                # Gate 1: a cancelled/aborted batch never probes.
+                if batch.cancelled():
+                    return
+                try:
+                    kwargs = taint_target(target, payload)
+                    if kwargs is None:
+                        return
+                    if target.url not in announced:
+                        announced.add(target.url)
+                        _publish(PageTesting(target.url))
+                        # One progress unit per (module, target) as reached.
+                        _publish(ProgressStep(1))
+                    output.debug("Testing: %s" % target.describe())
+                    resp = request.send(**kwargs)
+                    if resp is None:
+                        # Transport failure / cancel / scope skip: nothing to
+                        # detect; the worker converges without a finding.
+                        return
+                    label = detector(resp, payload)
+                    if label:
+                        # Record which field carried the payload so the report
+                        # (and its de-duplication) can tell apart issues on one
+                        # endpoint: the body fields for a JSON/XML/form target,
+                        # else the query parameters taint_url rewrote.
+                        if target.body_format:
+                            parameter = ",".join(target.params) or None
+                        else:
+                            parameter = self.tainted_params(target.url)
+                        # Gate 2: the batch owns Findings submission — a late
+                        # worker after close() cannot reach the collector.
+                        batch.finding(
+                            output,
+                            "That site may be vulnerable to %s at %s\nInjection: %s"
+                            % (label, target.describe(), payload),
+                            url=kwargs["url"],
+                            plugin=type(self).__name__,
+                            parameter=parameter,
+                            evidence="payload=%s | matched=%s" % (payload, label),
+                        )
+                except Exception as err:
+                    logger.error(err)
+                    output.debug("Injection error: %s" % err)
+
             try:
-                for future in as_completed(futures):
-                    if _cancelled():
-                        # Drop queued probes; in-flight ones finish on their own.
-                        executor.shutdown(cancel_futures=True)
-                        break
-                    future.result()
-            except KeyboardInterrupt:
-                executor.shutdown(False)
-                raise
+                batch.run([(probe, (p, t)) for p, t in work])
+            except BatchClosed:
+                return
 
     @staticmethod
     def tainted_params(url):

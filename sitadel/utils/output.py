@@ -53,6 +53,20 @@ class Output:
         ``plugin`` name), so even single-string findings gain a sane severity,
         confidence, and CWE/OWASP/WSTG mapping. Explicit arguments always win.
         """
+        # Batch gate: during the attack phase an active Batch registers itself
+        # here. When the scan was cancelled (or the batch aborted), findings
+        # from workers still unwinding are dropped so nothing can reach the
+        # report collector after the scan's completion event. Outside a batch
+        # (fingerprint/crawl phases, tests) no gate exists and behaviour is
+        # unchanged.
+        try:
+            batch = Services.get("attack_batch")
+        except NameError:
+            batch = None
+        if batch is not None and not batch.accepts_findings():
+            self.logger.info("Dropping finding after batch cancellation: %s",
+                             value)
+            return
         if not self.quiet:
             print(f"{self.g}[+]{self.e} {self.w}{value}{self.e}", flush=True)
         self.logger.info("FINDING: %s", value)

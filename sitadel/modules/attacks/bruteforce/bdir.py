@@ -1,5 +1,5 @@
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from ..batch import Batch
 from sitadel.utils.container import Services
 from .. import AttackPlugin
 
@@ -34,12 +34,7 @@ class Bdir(AttackPlugin):
             for b in backupdir:
                 bdir = b.replace("[name]", d)
                 urls.append(urljoin(str(start_url), str(bdir)))
-        # Bounded thread pool so the wordlist is probed concurrently.
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = [executor.submit(self.check_url, url) for url in urls]
-            try:
-                for future in as_completed(futures):
-                    future.result()
-            except KeyboardInterrupt:
-                executor.shutdown(False)
-                raise
+        # One cancellable batch: budget, futures, cancel and Findings share
+        # its state, so a cancelled scan converges without late findings.
+        with Batch(workers=20, name=type(self).__name__) as batch:
+            batch.run([(self.check_url, (url,)) for url in urls])

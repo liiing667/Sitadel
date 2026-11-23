@@ -14,7 +14,7 @@ this module never targets destructive endpoints. Shaped like ``open_redirect.py`
 (param-hint targeting, bounded pool, cooperative cancel).
 """
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from ..batch import Batch
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sitadel.config.settings import Risk
@@ -158,14 +158,5 @@ class Ssrf(AttackPlugin):
                 logger.error(e)
                 output.debug("SSRF error on %s: %s" % (url, e))
 
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = [executor.submit(scan, url) for url in targets]
-            try:
-                for future in as_completed(futures):
-                    if self._cancelled():
-                        executor.shutdown(cancel_futures=True)
-                        break
-                    future.result()
-            except KeyboardInterrupt:
-                executor.shutdown(False)
-                raise
+        with Batch(workers=20, name="Ssrf") as batch:
+            batch.run([(scan, (url,)) for url in targets])
